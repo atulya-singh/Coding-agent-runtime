@@ -1,0 +1,41 @@
+# Template task definition. Copy this directory into Tasks/dataset/<task_id>/ and
+# fill it in. See Tasks/schema.py for the authoritative field types.
+
+task_id: template-000
+repository: https://github.com/example/example-repo
+commit: "0000000000000000000000000000000000000000"
+language: python
+category: bug_fix # bug_fix | feature | refactor | testing | performance | api_change | dependency_migration
+difficulty: easy # easy | medium | hard
+
+description: |
+  One or two sentences describing what the agent must accomplish, written the way
+  a task issue would be written for a human contributor.
+
+# Shell commands run once after checkout, before the agent starts (e.g. installing
+# dependencies). Executed inside the sandbox via Sandbox.run_command.
+setup:
+  - pip install -e .
+
+# Command the agent is allowed to run/see while working.
+public_tests: pytest tests/test_public.py -q
+
+# Command used only during Phase 4 grading -- never shown to the agent.
+hidden_tests: pytest tests/test_hidden.py -q
+
+# Paths (relative to this task's hidden/ directory) of test files copied into the
+# sandboxed repo only at evaluation time, after the agent has finished.
+hidden_test_files:
+  - test_hidden.py
+
+expected_behavior: |
+  Free-text description of correct behavior, used as a supplementary signal (e.g.
+  for an LLM judge) -- never as the primary pass/fail criterion (see plan.md
+  Principle 1: objective evaluation).
+
+resource_limit:
+  cpus: 2.0
+  memory_gb: 4.0
+  timeout_seconds: 600
+  pids_limit: 100
+  network_enabled: false
