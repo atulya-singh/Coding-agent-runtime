@@ -41,7 +41,12 @@ class ToolResult:
         return asdict(self)
 
 
-def _log_event(tool_name: str, success: bool, duration_ms: float, error: Optional[str], metadata: dict) -> None:
+def log_tool_event(tool_name: str, success: bool, duration_ms: float, error: Optional[str], metadata: dict) -> None:
+    """Emit the one canonical `tool_call` log line.
+
+    Public so that tool implementations which can't use the @tool decorator (e.g.
+    the dispatcher rejecting an unknown tool name) still produce an identical event.
+    """
     event = {
         "event": "tool_call",
         "tool": tool_name,
@@ -88,11 +93,11 @@ def tool(name: str) -> Callable:
                 else:
                     output, metadata = result, {}
                 duration_ms = (time.monotonic() - start) * 1000
-                _log_event(name, True, duration_ms, None, metadata)
+                log_tool_event(name, True, duration_ms, None, metadata)
                 return ToolResult(tool=name, success=True, output=output, duration_ms=duration_ms, metadata=metadata)
             except Exception as exc:
                 duration_ms = (time.monotonic() - start) * 1000
-                _log_event(name, False, duration_ms, str(exc), {})
+                log_tool_event(name, False, duration_ms, str(exc), {})
                 return ToolResult(tool=name, success=False, error=str(exc), duration_ms=duration_ms)
 
         return wrapper

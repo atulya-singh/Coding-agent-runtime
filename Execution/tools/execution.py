@@ -10,7 +10,7 @@ DEFAULT_TEST_TIMEOUT = 300.0
 MAX_OUTPUT_CHARS = 20_000
 
 
-def _truncate(text: str) -> str:
+def truncate_output(text: str) -> str:
     if len(text) <= MAX_OUTPUT_CHARS:
         return text
     return text[:MAX_OUTPUT_CHARS] + f"\n...[truncated {len(text) - MAX_OUTPUT_CHARS} chars]"
@@ -26,8 +26,8 @@ def _run(command: str, cwd: Optional[str], timeout: float, env: Optional[dict]) 
     return {
         "command": command,
         "exit_code": proc.returncode,
-        "stdout": _truncate(proc.stdout),
-        "stderr": _truncate(proc.stderr),
+        "stdout": truncate_output(proc.stdout),
+        "stderr": truncate_output(proc.stderr),
         "success": proc.returncode == 0,
     }
 
@@ -39,8 +39,8 @@ def run_command(
     timeout: float = DEFAULT_COMMAND_TIMEOUT,
     env: Optional[dict] = None,
 ):
-    # Phase 1 only: runs on the host process. Phase 2 replaces this with sandboxed
-    # execution so agent-issued commands never touch the host directly.
+    # Host-side only. Agent-issued commands go through
+    # Execution.sandbox_tools.SandboxToolset.run_command instead.
     result = _run(command, cwd, timeout, env)
     return result, {"cwd": cwd}
 

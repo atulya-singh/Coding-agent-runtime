@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 import shutil
 import tempfile
 import time
@@ -9,7 +10,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional
 
 from Execution.tools.base import ToolTimeoutError
@@ -99,11 +100,29 @@ class Sandbox:
 
     # ---- lifecycle: RUN COMMAND / RUN TESTS -------------------------------
 
-    def run_command(self, command: str, cwd: str = REPO_DIR, timeout: Optional[float] = None) -> SandboxResult:
-        return self._run(command, cwd, timeout)
+    def run_command(
+        self,
+        command: str,
+        cwd: str = REPO_DIR,
+        timeout: Optional[float] = None,
+        stdin: Optional[str] = None,
+    ) -> SandboxResult:
+        return self._run(command, cwd, timeout, stdin)
 
     def run_tests(self, command: str = "pytest -q", cwd: str = REPO_DIR, timeout: Optional[float] = None) -> SandboxResult:
         return self._run(command, cwd, timeout)
+
+    def put_file(self, local_path: str, dest_path: str) -> None:
+        """Copy a single host file to an absolute path inside the container.
+
+        Used to inject the in-container tool host, and by Phase 4 to overlay hidden
+        test files over the agent's copy before grading.
+        """
+        assert self.container_id, "sandbox not created"
+        parent = str(PurePosixPath(dest_path).parent)
+        self._exec_or_raise(f"mkdir -p {shlex.quote(parent)}")
+        docker.copy_into_container(self.container_id, local_path, dest_path)
+        logger.info(_event(self.task_id, "sandbox_put_file", {"dest_path": dest_path}))
 
     # ---- lifecycle: COLLECT RESULTS ----------------------------------------
 
@@ -138,7 +157,7 @@ class Sandbox:
 
     # ---- internals -----------------------------------------------------------
 
-    def _run(self, command: str, cwd: str, timeout: Optional[float]) -> SandboxResult:
+    def _run(self, command: str, cwd: str, timeout: Optional[float], stdin: Optional[str] = None) -> SandboxResult:
         assert self.container_id, "sandbox not created"
         effective_timeout = timeout or self.config.timeout_seconds
         self.state = SandboxState.RUNNING
@@ -146,12 +165,14 @@ class Sandbox:
         start = time.monotonic()
 
         try:
-            result = docker.exec_in_container(self.container_id, command, cwd=cwd, timeout=effective_timeout)
+            result = docker.exec_in_container(
+                self.container_id, command, cwd=cwd, timeout=effective_timeout, stdin=stdin
+            )
         except ToolTimeoutError as exc:
             duration_ms = (time.monotonic() - start) * 1000
             logger.error(_event(self.task_id, "sandbox_run_timeout", {"command": command, "timeout": effective_timeout}))
             sandbox_result = SandboxResult(exit_code=-1, stdout="", stderr=str(exc), success=False, duration_ms=duration_ms, timed_out=True)
-            self._record_run(command, cwd, sandbox_result)
+            self._record_run(command, cwd, sandbox_result, stdin)
             # A killed `docker exec` client does not kill the process it started
             # inside the container -- tear the whole container down so a hung
             # command can't keep burning its CPU/pids quota. Must happen after
@@ -175,15 +196,18 @@ class Sandbox:
                 {"command": command, "exit_code": sandbox_result.exit_code, "duration_ms": round(duration_ms, 2)},
             )
         )
-        self._record_run(command, cwd, sandbox_result)
+        self._record_run(command, cwd, sandbox_result, stdin)
         return sandbox_result
 
-    def _record_run(self, command: str, cwd: str, result: SandboxResult) -> None:
+    def _record_run(self, command: str, cwd: str, result: SandboxResult, stdin: Optional[str] = None) -> None:
         entry = {
             "run_index": self._run_count,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "command": command,
             "cwd": cwd,
+            # Size only: stdin can be a whole file being written, and the audit log
+            # should stay readable.
+            "stdin_bytes": len(stdin.encode("utf-8")) if stdin else 0,
             "exit_code": result.exit_code,
             "duration_ms": round(result.duration_ms, 2),
             "success": result.success,

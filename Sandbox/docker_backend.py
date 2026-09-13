@@ -21,9 +21,13 @@ if not logger.handlers:
 DEFAULT_DOCKER_TIMEOUT = 30.0
 
 
-def _docker(args: list[str], timeout: float = DEFAULT_DOCKER_TIMEOUT) -> subprocess.CompletedProcess:
+def _docker(
+    args: list[str], timeout: float = DEFAULT_DOCKER_TIMEOUT, stdin: Optional[str] = None
+) -> subprocess.CompletedProcess:
     try:
-        return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(
+            ["docker", *args], input=stdin, capture_output=True, text=True, timeout=timeout
+        )
     except subprocess.TimeoutExpired as exc:
         raise ToolTimeoutError(f"docker {' '.join(args)} timed out after {timeout}s") from exc
     except FileNotFoundError as exc:
@@ -104,13 +108,21 @@ def start_container(container_id: str) -> None:
 
 
 def exec_in_container(
-    container_id: str, command: str, cwd: Optional[str] = None, timeout: float = 60.0
+    container_id: str,
+    command: str,
+    cwd: Optional[str] = None,
+    timeout: float = 60.0,
+    stdin: Optional[str] = None,
 ) -> dict:
     args = ["exec"]
+    if stdin is not None:
+        # Keeps large payloads (a file being written, a search request) out of argv
+        # and therefore out of the command string that gets logged.
+        args.append("-i")
     if cwd:
         args += ["--workdir", cwd]
     args += [container_id, "sh", "-c", command]
-    proc = _docker(args, timeout=timeout)
+    proc = _docker(args, timeout=timeout, stdin=stdin)
     return {
         "exit_code": proc.returncode,
         "stdout": proc.stdout,

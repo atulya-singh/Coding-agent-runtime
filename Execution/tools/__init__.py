@@ -1,7 +1,10 @@
-"""Structured, logged, timeout-bound tools the agent uses to inspect and modify a repo.
+"""Structured, logged, timeout-bound tools for inspecting and modifying a repo.
 
-Phase 1 only: run_command/run_tests execute on the host process. Phase 2 wraps all
-execution in a sandbox so agent-issued commands never touch the host directly.
+These run in the HOST process and are for harness-side use only. Agent-driven calls
+must go through `Execution.sandbox_tools.SandboxToolset`, which exposes the same
+seven tools with the same ToolResult/logging contract but executes them inside a
+Sandbox container -- plan.md's Phase 1 rule is that the model never runs anything on
+the host. `base.py` is shared by both.
 """
 from .base import ToolExecutionError, ToolResult, ToolTimeoutError
 from .execution import run_command, run_tests
