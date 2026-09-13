@@ -1,0 +1,45 @@
+task_id: requests-001-netrc-empty-default
+repository: https://github.com/psf/requests.git
+commit: "1b40fdd004bfc8ba5301bcf8a6908264e9b6b877"
+language: python
+category: bug_fix
+difficulty: easy
+
+description: |
+  requests.utils.get_netrc_auth() is supposed to return None when no usable
+  credentials are found in the user's netrc file. However, when a matching netrc
+  entry exists but supplies no real login or password (e.g. a bare `default` entry
+  with no credentials), the current implementation still treats it as truthy and
+  returns bogus/empty credentials instead of None.
+
+  Fix get_netrc_auth in src/requests/utils.py so it correctly returns None when the
+  matched netrc entry does not actually supply a login or password.
+
+setup:
+  - pip install -e .
+  - pip install pytest
+
+# Existing regression tests for this function -- the agent can run these to check
+# it hasn't broken other netrc-parsing behavior while fixing the bug.
+public_tests: pytest tests/test_utils.py -k TestGetNetrcAuth -q
+
+# Real upstream fix: https://github.com/psf/requests/commit/47914226 (PR #7205)
+hidden_tests: pytest tests/test_utils.py -k test_empty_default_credentials_ignored -q
+
+# Full post-fix tests/test_utils.py, copied over the repo's copy at evaluation time
+# (Phase 4) before running hidden_tests -- never shown to the agent during the run.
+hidden_test_files:
+  - tests/test_utils.py
+
+expected_behavior: |
+  get_netrc_auth(url) returns None (not a tuple of empty/placeholder values) when
+  the resolved netrc entry does not supply a real login or password.
+
+resource_limit:
+  cpus: 2.0
+  memory_gb: 2.0
+  timeout_seconds: 300
+  pids_limit: 100
+  # Setup needs PyPI to install requests' own runtime deps (urllib3, idna, etc.)
+  # and pytest. The fix and both test commands make no real network calls.
+  network_enabled: true
