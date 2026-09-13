@@ -16,8 +16,12 @@ description: |
   matched netrc entry does not actually supply a login or password.
 
 setup:
-  - pip install -e .
-  - pip install pytest
+  # Versions pinned exactly (not "latest") so the task installs the same known-good
+  # bits forever -- floating installs are a supply-chain risk and a reproducibility
+  # hazard. requests' own runtime deps come from its pinned ranges in pyproject.toml
+  # at this commit, so `-e .` alone doesn't float either.
+  - pip install --no-input -e .
+  - pip install --no-input pytest==8.3.3
 
 # Existing regression tests for this function -- the agent can run these to check
 # it hasn't broken other netrc-parsing behavior while fixing the bug.

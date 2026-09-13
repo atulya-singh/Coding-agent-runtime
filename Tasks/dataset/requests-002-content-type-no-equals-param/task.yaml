@@ -1,0 +1,57 @@
+task_id: requests-002-content-type-no-equals-param
+repository: https://github.com/psf/requests.git
+commit: "bc7dd0fc4d56e808bcdd85ac2d797b3107c89259"
+language: python
+category: bug_fix
+difficulty: easy
+
+description: |
+  requests.utils._parse_content_type_header(header) parses a Content-Type-style
+  header into (content_type, params_dict). Each `;`-separated segment is supposed
+  to become a params_dict entry only when it actually has a `key=value` form.
+
+  The current implementation instead treats *any* non-empty segment as a valid
+  param, even ones with no `=` in them (e.g. a bare `no_equals` flag with no value).
+  For such segments it inserts a bogus entry into params_dict with the raw segment
+  text as the key and the value True -- polluting the returned dict with a garbage
+  boolean entry that was never a real key=value pair. This also crashes
+  get_encoding_from_headers when a header contains a bare `charset` flag with no
+  value, since the code then calls .strip() on the boolean True.
+
+  Fix _parse_content_type_header in src/requests/utils.py so that a `;`-separated
+  segment with no `=` is skipped entirely, rather than being added to params_dict
+  as a bogus {segment: True} entry.
+
+setup:
+  # Versions pinned exactly (not "latest") -- floating installs are a supply-chain
+  # risk and a reproducibility hazard. requests' own runtime deps come from its
+  # pinned ranges in pyproject.toml at this commit, so `-e .` alone doesn't float.
+  - pip install --no-input -e .
+  - pip install --no-input pytest==8.3.3
+
+# Adjacent, unaffected header-parsing test -- confirms the fix didn't break
+# unrelated dict-header parsing.
+public_tests: pytest tests/test_utils.py -k test_parse_dict_header -q
+
+# Real upstream fix: https://github.com/psf/requests/commit/f0198e6d (PR #7309)
+hidden_tests: pytest tests/test_utils.py -k "test__parse_content_type_header or test_get_encoding_from_headers" -q
+
+# Full post-fix tests/test_utils.py, copied over the repo's copy at evaluation time
+# (Phase 4) before running hidden_tests -- never shown to the agent during the run.
+hidden_test_files:
+  - tests/test_utils.py
+
+expected_behavior: |
+  _parse_content_type_header(header) ignores any `;`-separated segment that has no
+  `=`, instead of inserting a bogus {segment: True} entry into the returned params
+  dict. get_encoding_from_headers no longer crashes on a header containing a bare
+  flag-like param (e.g. "text/html; charset").
+
+resource_limit:
+  cpus: 2.0
+  memory_gb: 2.0
+  timeout_seconds: 300
+  pids_limit: 100
+  # Setup needs PyPI to install requests' own runtime deps (urllib3, idna, etc.)
+  # and pinned pytest. The fix and both test commands make no real network calls.
+  network_enabled: true

@@ -1,0 +1,56 @@
+task_id: requests-003-jsondecodeerror-pickle
+repository: https://github.com/psf/requests.git
+commit: "96b22fa18c00831656ee4b286bf1c9062459b00a"
+language: python
+category: bug_fix
+difficulty: medium
+
+description: |
+  requests.exceptions.JSONDecodeError should be picklable like any other exception,
+  since it's common to pass exceptions across process boundaries (e.g. a
+  multiprocessing pool worker reporting a failure back to its parent).
+
+  Currently, pickling a JSONDecodeError instance and unpickling it raises a
+  TypeError, because of the class's method resolution order: JSONDecodeError
+  inherits from both InvalidJSONError and the stdlib/simplejson
+  CompatJSONDecodeError, and Python picks IOError's __reduce__ over
+  CompatJSONDecodeError's during pickling. IOError's __reduce__ only preserves one
+  of the three constructor args JSONDecodeError actually needs (msg, doc, pos), so
+  unpickling fails with "missing 2 required positional arguments: 'doc' and 'pos'".
+
+  Fix this in src/requests/exceptions.py by giving JSONDecodeError its own
+  __reduce__ method that explicitly delegates to CompatJSONDecodeError's
+  __reduce__, so all constructor args survive a pickle round-trip.
+
+setup:
+  # Versions pinned exactly (not "latest") -- floating installs are a supply-chain
+  # risk and a reproducibility hazard. requests' own runtime deps come from its
+  # pinned ranges in pyproject.toml at this commit, so `-e .` alone doesn't float.
+  - pip install --no-input -e .
+  - pip install --no-input pytest==8.3.3
+
+# Adjacent, unaffected JSON-body test -- confirms the fix didn't break unrelated
+# JSON request-preparation behavior.
+public_tests: pytest tests/test_requests.py -k test_json_encodes_as_bytes -q
+
+# Real upstream fix: https://github.com/psf/requests/commit/3ff3ff21 (fixes #6628)
+hidden_tests: pytest tests/test_requests.py -k test_json_decode_errors_are_serializable_deserializable -q
+
+# Full post-fix tests/test_requests.py, copied over the repo's copy at evaluation
+# time (Phase 4) before running hidden_tests -- never shown to the agent during the run.
+hidden_test_files:
+  - tests/test_requests.py
+
+expected_behavior: |
+  pickle.loads(pickle.dumps(json_decode_error)) round-trips a JSONDecodeError
+  instance without raising, and the deserialized instance's repr matches the
+  original's.
+
+resource_limit:
+  cpus: 2.0
+  memory_gb: 2.0
+  timeout_seconds: 300
+  pids_limit: 100
+  # Setup needs PyPI to install requests' own runtime deps (urllib3, idna, etc.)
+  # and pinned pytest. The fix and both test commands make no real network calls.
+  network_enabled: true
