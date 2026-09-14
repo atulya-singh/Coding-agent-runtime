@@ -1,0 +1,70 @@
+task_id: requests-004-header-name-validation
+repository: https://github.com/psf/requests.git
+commit: "60865f21aea4eb319d5b916adcc76de10c64e506"
+language: python
+category: feature
+difficulty: medium
+
+description: |
+  requests.utils.check_header_validity((name, value)) guards against header
+  injection before a request is sent. Today it only inspects the *value* half of
+  the pair: it rejects a value containing CR/LF or leading whitespace, and
+  rejects a value that isn't str or bytes.
+
+  The name half is not checked at all. That means a header name containing a
+  newline, a leading space, or a `:` is accepted and written straight into the
+  request, which is exactly the injection the value check exists to prevent
+  (e.g. {"fo\no": "bar"} smuggles a second header line).
+
+  Add validation of the header name:
+
+  - A name must not contain CR, LF, `:`, or leading whitespace.
+  - A value must keep its existing rules (no CR/LF, no leading whitespace).
+  - Both parts must be str or bytes; anything else raises InvalidHeader naming
+    the offending part.
+  - Every rejection raises requests.exceptions.InvalidHeader, as it does today.
+
+  Both str and bytes headers must be supported, and valid headers must keep
+  working unchanged.
+
+setup:
+  # Versions pinned exactly (not "latest") -- floating installs are a supply-chain
+  # risk and a reproducibility hazard. requests' own runtime deps come from its
+  # pinned ranges in setup.py at this commit, so `-e .` alone doesn't float.
+  - pip install --no-input -e .
+  - pip install --no-input pytest==8.3.3
+
+# Adjacent header-parsing tests, unaffected by this change -- the agent can run
+# these to confirm it hasn't broken neighbouring header handling.
+public_tests: pytest tests/test_utils.py -k header -q
+
+# Real upstream feature: https://github.com/psf/requests/commit/e36f3459 (PR #6154)
+hidden_tests: pytest tests/test_header_validation.py -q
+
+# A new file, so the agent's own edits to existing test files can't affect it.
+# The upstream tests for this change go through requests.get() and need the
+# httpbin fixture; these exercise check_header_validity directly instead, which
+# keeps grading network-free and matches the dataset's minimal-install policy.
+hidden_test_files:
+  - tests/test_header_validation.py
+
+# The upstream feature commit; `commit` above is its parent. Used by Tasks.verify.
+reference_commit: "e36f34597ca96c40dbb81d63a8fe9ac0860b8dc3"
+reference_paths:
+  - requests/_internal_utils.py
+  - requests/utils.py
+
+expected_behavior: |
+  check_header_validity(("fo\no", "bar")) raises InvalidHeader, as do names with
+  a leading space, a tab, or a ':'. Non-str/bytes names and values raise
+  InvalidHeader naming the offending part. Valid str and bytes headers, and the
+  pre-existing value rules, are unchanged.
+
+resource_limit:
+  cpus: 2.0
+  memory_gb: 2.0
+  timeout_seconds: 300
+  pids_limit: 100
+  # Setup needs PyPI for requests' own runtime deps (urllib3, idna, certifi,
+  # charset_normalizer) and pinned pytest. No test command makes a network call.
+  network_enabled: true

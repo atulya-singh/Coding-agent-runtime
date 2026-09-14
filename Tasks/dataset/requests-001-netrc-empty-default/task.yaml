@@ -35,6 +35,13 @@ hidden_tests: pytest tests/test_utils.py -k test_empty_default_credentials_ignor
 hidden_test_files:
   - tests/test_utils.py
 
+# The upstream fix itself. `commit` above is its parent. Tasks.verify replays
+# these paths over the base checkout to prove the task is solvable and that the
+# hidden test really does distinguish the two states. Never shown to the agent.
+reference_commit: "47914226c2968802f2cdee3f6f0f6e06e4472f64"
+reference_paths:
+  - src/requests/utils.py
+
 expected_behavior: |
   get_netrc_auth(url) returns None (not a tuple of empty/placeholder values) when
   the resolved netrc entry does not supply a real login or password.

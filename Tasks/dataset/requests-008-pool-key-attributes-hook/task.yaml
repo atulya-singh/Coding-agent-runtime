@@ -1,0 +1,74 @@
+task_id: requests-008-pool-key-attributes-hook
+repository: https://github.com/psf/requests.git
+commit: "88dce9d854797c05d0ff296b70e0430535ef8aaf"
+language: python
+category: api_change
+difficulty: medium
+
+description: |
+  HTTPAdapter.get_connection_with_tls_context() decides which urllib3 connection
+  pool a request goes to. It computes the pool key by calling the module-level
+  helper _urllib3_request_context(request, verify, cert) directly:
+
+      host_params, pool_kwargs = _urllib3_request_context(request, verify, cert)
+
+  Because that call is to a private module-level function rather than through
+  self, a subclass has no seam to influence the pool key. That removed a
+  supported use case: supplying a custom ssl.SSLContext from a transport adapter
+  (see psf/requests#6715).
+
+  Add a public, overridable hook while preserving existing behavior:
+
+  - Add a method
+    `HTTPAdapter.build_connection_pool_key_attributes(request, verify, cert=None)`
+    that returns the (host_params, pool_kwargs) two-tuple. Its default
+    implementation must produce exactly what _urllib3_request_context produces
+    today.
+  - get_connection_with_tls_context() must obtain the pool key by calling that
+    method on self, so a subclass overriding it changes which pool is used.
+  - Everything else stays as it is: the same ValueError -> InvalidURL wrapping,
+    the same proxy handling, the same pool kwargs for each form of `verify`
+    (True, False, a bundle path, a directory) and for `cert`.
+
+setup:
+  # Versions pinned exactly (not "latest") -- floating installs are a supply-chain
+  # risk and a reproducibility hazard. requests' own runtime deps come from its
+  # pinned ranges in pyproject.toml at this commit, so `-e .` alone doesn't float.
+  - pip install --no-input -e .
+  - pip install --no-input pytest==8.3.3
+
+# Existing adapter tests -- small, network-free, and the agent's fastest check
+# that it hasn't disturbed adapter behavior.
+public_tests: pytest tests/test_adapters.py -q
+
+# Real upstream change: https://github.com/psf/requests/commit/a62a2d35
+hidden_tests: pytest tests/test_pool_key_attributes.py -q
+
+hidden_test_files:
+  - tests/test_pool_key_attributes.py
+
+# "...while preserving existing behavior" is half the task, so the preserved half
+# is graded too. Without this, gutting adapters.py would pass the new-API tests.
+regression_tests: pytest tests/test_adapters.py tests/test_utils.py -q
+
+# The upstream change; `commit` above is its parent. Used by Tasks.verify.
+reference_commit: "a62a2d35d918baa8e793f7aa4fb41527644dfca5"
+reference_paths:
+  - src/requests/adapters.py
+
+expected_behavior: |
+  HTTPAdapter().build_connection_pool_key_attributes(request, verify, cert)
+  returns the same (host_params, pool_kwargs) pair that
+  _urllib3_request_context(request, verify, cert) returns, for every form of
+  verify and cert. A subclass that overrides the method and injects its own
+  pool_kwargs sees those kwargs used by get_connection_with_tls_context, and a
+  malformed URL still raises InvalidURL.
+
+resource_limit:
+  cpus: 2.0
+  memory_gb: 2.0
+  timeout_seconds: 300
+  pids_limit: 100
+  # Setup needs PyPI for requests' own runtime deps and pinned pytest. Building a
+  # connection pool object opens no socket, so no test command uses the network.
+  network_enabled: true

@@ -1,0 +1,78 @@
+task_id: requests-006-lookupdict-attribute-tests
+repository: https://github.com/psf/requests.git
+commit: "27e0981962d355b9532256f4dcb3d42f64b04d9c"
+language: python
+category: testing
+difficulty: easy
+
+description: |
+  requests.structures.LookupDict is the class behind `requests.codes`, so
+  `requests.codes.not_found` is an attribute lookup on one of these. Its test
+  class, TestLookupDict in tests/test_structures.py, currently covers only
+  __getitem__ and get() -- the item-access half. The attribute-access half, which
+  is how essentially every caller actually uses it, is untested.
+
+  Add tests to tests/test_structures.py::TestLookupDict covering attribute
+  access:
+
+  - hasattr() is True for a key that was set, and False for one that was not.
+  - getattr() returns the value for a key that was set, and raises
+    AttributeError for one that was not.
+  - getattr() with a default returns the value for a key that was set, and the
+    default for one that was not.
+
+  Do not change src/requests/structures.py. The task is the tests.
+
+setup:
+  # Versions pinned exactly (not "latest") -- floating installs are a supply-chain
+  # risk and a reproducibility hazard. requests' own runtime deps come from its
+  # pinned ranges in pyproject.toml at this commit, so `-e .` alone doesn't float.
+  - pip install --no-input -e .
+  - pip install --no-input pytest==8.3.3
+
+# The file the agent is extending. Running it is how the agent checks its work.
+public_tests: pytest tests/test_structures.py -q
+
+# Graded by mutation, not by passing: an empty test file passes. Real upstream
+# commit these tests come from: https://github.com/psf/requests/commit/8f6cda99
+# (PR #7401).
+agent_tests: pytest tests/test_structures.py -q
+
+# Each mutation plants a bug in LookupDict's attribute-access behavior that the
+# pre-existing item-access tests do NOT catch. The tests written for this task
+# must fail against every one of them -- that is the whole criterion.
+mutations:
+  - name: getattr_returns_none
+    files:
+      - src/requests/structures.py
+    description: |
+      __getattr__ returns None for unknown attributes instead of raising, so a
+      typo like requests.codes.not_fond silently yields None. hasattr() becomes
+      True for everything.
+
+  - name: getattr_raises_keyerror
+    files:
+      - src/requests/structures.py
+    description: |
+      __getattr__ raises KeyError rather than AttributeError for unknown
+      attributes. hasattr() only swallows AttributeError, so the KeyError escapes
+      to the caller instead of returning False.
+
+# The upstream commit that added these tests; `commit` above is its parent. Here
+# the reference solution is a test file, since the agent's deliverable is tests.
+reference_commit: "8f6cda9969f4a98c45ea2922f6bcbefc02256202"
+reference_paths:
+  - tests/test_structures.py
+
+expected_behavior: |
+  tests/test_structures.py passes against the unmodified source, and fails
+  against each planted mutation. LookupDict itself is unchanged.
+
+resource_limit:
+  cpus: 2.0
+  memory_gb: 2.0
+  timeout_seconds: 300
+  pids_limit: 100
+  # Setup needs PyPI for requests' own runtime deps and pinned pytest. The tests
+  # themselves are pure in-memory data-structure checks.
+  network_enabled: true

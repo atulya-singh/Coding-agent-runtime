@@ -1,0 +1,85 @@
+task_id: requests-007-proxy-bypass-short-circuit
+repository: https://github.com/psf/requests.git
+commit: "d09659997cd1e3eca49a07c59ece5557071c0ab9"
+language: python
+category: performance
+difficulty: easy
+
+description: |
+  requests 2.26.0 introduced a performance regression for hosts with a large
+  number of proxies configured in the environment. Every request pays for it,
+  including ones that have explicitly opted out of environment configuration.
+
+  The cost is in requests.utils.resolve_proxies(). It calls
+  should_bypass_proxies() unconditionally and stores the answer in a local, then
+  uses that local only inside a branch also guarded by trust_env:
+
+      bypass_proxy = should_bypass_proxies(url, no_proxy=no_proxy)
+      if trust_env and not bypass_proxy:
+          ...
+
+  should_bypass_proxies() is O(len(no_proxy)) -- it splits and scans the whole
+  no_proxy list, then hands it to urllib's proxy_bypass, which scans it again.
+  When trust_env is False, that entire scan is computed and thrown away.
+
+  Fix the regression so the bypass check is only performed when its result can
+  actually be used. Behavior must not change for any input.
+
+setup:
+  # Versions pinned exactly (not "latest") -- floating installs are a supply-chain
+  # risk and a reproducibility hazard. requests' own runtime deps come from its
+  # pinned ranges in setup.py at this commit, so `-e .` alone doesn't float.
+  - pip install --no-input -e .
+  - pip install --no-input pytest==8.3.3
+  # Several proxy tests in the regression command use pytest-mock's `mocker`
+  # fixture. Upstream dropped that requirement later; this task is pinned to the
+  # tree as it stood in Dec 2021, so it needs what the tree needed then.
+  - pip install --no-input pytest-mock==3.14.0
+
+# Proxy-resolution unit tests -- the agent can run these to confirm the
+# short-circuit didn't change any answers.
+public_tests: pytest tests/test_utils.py -k proxies -q
+
+# Real upstream fix: https://github.com/psf/requests/commit/0d5347e6 (PR #5924)
+# Nothing fails before a performance fix, so the criterion is a measurement.
+# The benchmark reports the cost of resolve_proxies(trust_env=False) divided by
+# the cost of the same call with trust_env=True, measured in the same process --
+# a ratio, so the threshold holds on any machine. Measured on this base commit:
+# 0.4997 (+/- 0.0003 across runs). Measured with the upstream fix applied:
+# 0.000027. The 0.25 bar sits four orders of magnitude clear of the fixed value
+# and half a factor clear of the broken one.
+benchmark:
+  command: python benchmarks/bench_resolve_proxies.py
+  max_ratio: 0.25
+  baseline_ratio: 0.50
+  runs: 3
+
+# A benchmark alone would reward "delete the bypass check entirely", which is
+# fast and wrong. These pin the behavior the speed-up has to preserve.
+regression_tests: pytest tests/test_utils.py -q
+
+# The benchmark script is copied in at evaluation time like a hidden test, so the
+# agent can't tune to the threshold or edit the measurement.
+hidden_test_files:
+  - benchmarks/bench_resolve_proxies.py
+
+# The upstream fix; `commit` above is its parent. Used by Tasks.verify to confirm
+# the benchmark really does separate the two states.
+reference_commit: "0d5347e6281c85059be176fe650b0aa7128f1dcb"
+reference_paths:
+  - requests/utils.py
+
+expected_behavior: |
+  resolve_proxies() does not call should_bypass_proxies() when trust_env is
+  False, so the call costs effectively nothing regardless of how large no_proxy
+  is. With trust_env true, the resolved mapping is exactly what it was before,
+  for every combination of explicit proxies, no_proxy, and environment proxies.
+
+resource_limit:
+  cpus: 2.0
+  memory_gb: 2.0
+  timeout_seconds: 600
+  pids_limit: 100
+  # Setup needs PyPI for requests' own runtime deps and pinned pytest. The
+  # benchmark is pure in-process string work and opens no socket.
+  network_enabled: true

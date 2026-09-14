@@ -1,0 +1,86 @@
+task_id: requests-005-resolve-proxies-extraction
+repository: https://github.com/psf/requests.git
+commit: "590350f8d094c216051510ed1dd18fe871b53b72"
+language: python
+category: refactor
+difficulty: medium
+
+description: |
+  Proxy resolution currently lives inline inside
+  requests.sessions.SessionRedirectMixin.rebuild_proxies(). That method does two
+  unrelated jobs at once: it works out which proxies apply to a URL (reading
+  no_proxy, consulting the environment when trust_env is set), and it strips the
+  Proxy-Authorization header on redirect. Because the first job is trapped inside
+  a redirect-handling method, Session.send() cannot reuse it and has to call
+  rebuild_proxies() just to get a proxy mapping.
+
+  Refactor, without changing behavior:
+
+  - Add a module-level function `resolve_proxies(request, proxies, trust_env=True)`
+    to requests/utils.py that returns the resolved proxy mapping. It takes a
+    Request or PreparedRequest, must honour a `no_proxy` key inside `proxies`,
+    must tolerate `proxies` being None, and must consult the environment only
+    when trust_env is true and the URL is not bypassed.
+  - rebuild_proxies() keeps its existing signature and behavior (including
+    stripping Proxy-Authorization on redirect) but gets the mapping from
+    resolve_proxies() instead of computing it inline.
+  - Session.send() takes its proxy mapping from resolve_proxies() directly
+    rather than calling rebuild_proxies(). This is the point of the exercise:
+    a plain send() should no longer inherit redirect-time behavior, so a
+    caller-supplied Proxy-Authorization header survives being sent.
+
+  Redirect handling itself is unchanged.
+
+setup:
+  # Versions pinned exactly (not "latest") -- floating installs are a supply-chain
+  # risk and a reproducibility hazard. requests' own runtime deps come from its
+  # pinned ranges in setup.py at this commit, so `-e .` alone doesn't float.
+  - pip install --no-input -e .
+  - pip install --no-input pytest==8.3.3
+  # Heavier than the other tasks, and not optional: at this commit
+  # tests/conftest.py imports trustme at module level, so nothing under tests/
+  # can even be collected without it, and several proxy tests in the regression
+  # command use pytest-mock's `mocker` fixture. Upstream dropped both
+  # requirements later; this task is pinned to the state of the tree in
+  # Oct 2021, so it needs what the tree needed then.
+  - pip install --no-input pytest-mock==3.14.0 cryptography==43.0.1 trustme==0.9.0
+
+# Existing proxy-handling unit tests -- the agent can run these while working.
+public_tests: pytest tests/test_utils.py -k proxies -q
+
+# Real upstream refactor: https://github.com/psf/requests/commit/99b3b492 (PR #5924)
+# A refactor breaks no test, so the graded criterion is structural + behavioral:
+# resolve_proxies must exist with the right contract, rebuild_proxies must still
+# behave identically, and sessions.py must no longer carry the duplicated logic.
+hidden_tests: pytest tests/test_resolve_proxies.py -q
+
+hidden_test_files:
+  - tests/test_resolve_proxies.py
+
+# Without this, "delete requests/sessions.py" would satisfy a purely structural
+# check. The whole utils suite is network-free and covers the moved logic.
+regression_tests: pytest tests/test_utils.py -q
+
+# The upstream refactor; `commit` above is its parent. Used by Tasks.verify.
+reference_commit: "99b3b492418d0751ca960178d274f89805095e4c"
+reference_paths:
+  - requests/utils.py
+  - requests/sessions.py
+
+expected_behavior: |
+  requests.utils.resolve_proxies(request, proxies, trust_env) returns the same
+  mapping rebuild_proxies used to compute inline: the caller's proxies, plus an
+  environment proxy for the URL's scheme when trust_env is true and the URL is
+  not covered by no_proxy. rebuild_proxies still strips Proxy-Authorization on
+  redirect and still returns the same mapping. Session.send() resolves proxies
+  without going through rebuild_proxies, so a Proxy-Authorization header set by
+  the caller is still present on the request that reaches the adapter.
+
+resource_limit:
+  cpus: 2.0
+  memory_gb: 2.0
+  timeout_seconds: 300
+  pids_limit: 100
+  # Setup needs PyPI for requests' own runtime deps and pinned pytest. No test
+  # command makes a network call -- proxy resolution is pure string/env work.
+  network_enabled: true

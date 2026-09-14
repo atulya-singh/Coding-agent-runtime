@@ -41,6 +41,11 @@ hidden_tests: pytest tests/test_requests.py -k test_json_decode_errors_are_seria
 hidden_test_files:
   - tests/test_requests.py
 
+# The upstream fix itself; `commit` above is its parent. Used by Tasks.verify.
+reference_commit: "3ff3ff21dd45957c9e143cd500291959bb15f690"
+reference_paths:
+  - src/requests/exceptions.py
+
 expected_behavior: |
   pickle.loads(pickle.dumps(json_decode_error)) round-trips a JSONDecodeError
   instance without raising, and the deserialized instance's repr matches the

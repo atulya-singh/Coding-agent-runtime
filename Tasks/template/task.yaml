@@ -20,13 +20,50 @@ setup:
 # Command the agent is allowed to run/see while working.
 public_tests: pytest tests/test_public.py -q
 
-# Command used only during Phase 4 grading -- never shown to the agent.
+# Command used only during Phase 4 grading -- never shown to the agent. Must fail
+# on `commit` and pass once the change is made.
 hidden_tests: pytest tests/test_hidden.py -q
 
 # Paths (relative to this task's hidden/ directory) of test files copied into the
 # sandboxed repo only at evaluation time, after the agent has finished.
 hidden_test_files:
   - test_hidden.py
+
+# Must pass BOTH before and after the change. public_tests are advisory and
+# agent-visible; these are graded, and stop a "solution" that satisfies
+# hidden_tests by breaking everything around it. Required for refactor,
+# api_change and performance.
+# regression_tests: pytest tests/test_existing.py -q
+
+# `performance` only. `command` must print one float to stdout: the ratio of the
+# hot path to an in-process control measured in the same run. A ratio, not
+# seconds, so the threshold survives moving between machines.
+# benchmark:
+#   command: python benchmarks/bench_thing.py
+#   max_ratio: 0.25        # pass when the measured ratio is <= this
+#   baseline_ratio: 0.50   # what the unfixed base scores; must exceed max_ratio
+#   runs: 3                # median of N
+
+# `testing` only, where the agent writes the tests. Passing proves nothing on its
+# own -- an empty file passes -- so the tests are graded by mutation: they must
+# pass on clean source and FAIL against every planted break. Replacement files
+# live in hidden/mutations/<name>/<path-matching-repo-layout>.
+# agent_tests: pytest tests/test_thing.py -q
+# mutations:
+#   - name: off_by_one
+#     files:
+#       - src/pkg/thing.py
+#     description: |
+#       What was broken and why the pre-existing tests do not already catch it.
+
+# The real upstream commit this task was mined from -- `commit` above is its
+# PARENT, the pre-change state the agent starts from. `reference_paths` are the
+# files to take from it to reconstruct the intended solution. Used by
+# `python -m Tasks.verify` to prove the task is solvable and that the grading
+# criterion separates the two states. Never shown to the agent.
+reference_commit: "1111111111111111111111111111111111111111"
+reference_paths:
+  - src/pkg/thing.py
 
 expected_behavior: |
   Free-text description of correct behavior, used as a supplementary signal (e.g.

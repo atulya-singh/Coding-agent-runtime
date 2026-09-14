@@ -41,6 +41,11 @@ hidden_tests: pytest tests/test_utils.py -k "test__parse_content_type_header or 
 hidden_test_files:
   - tests/test_utils.py
 
+# The upstream fix itself; `commit` above is its parent. Used by Tasks.verify.
+reference_commit: "f0198e6dfc431a2293dc16e1b1e8fcddc910a7f3"
+reference_paths:
+  - src/requests/utils.py
+
 expected_behavior: |
   _parse_content_type_header(header) ignores any `;`-separated segment that has no
   `=`, instead of inserting a bogus {segment: True} entry into the returned params

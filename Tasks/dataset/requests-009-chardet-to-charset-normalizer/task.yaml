@@ -1,0 +1,75 @@
+task_id: requests-009-chardet-to-charset-normalizer
+repository: https://github.com/psf/requests.git
+commit: "33d448eb21bbbf643cc1f61493b0b606d8352aea"
+language: python
+category: dependency_migration
+difficulty: medium
+
+description: |
+  requests depends on chardet for encoding detection (Response.apparent_encoding
+  and, through it, Response.text). chardet is LGPL, which makes the licence
+  status of anything that bundles requests ambiguous, so the dependency is being
+  replaced with charset_normalizer, which is MIT.
+
+  The environment has already been migrated: charset_normalizer is installed and
+  chardet is not. requests does not currently start at all --
+  `import requests` fails with ModuleNotFoundError: No module named 'chardet'.
+
+  Migrate the code:
+
+  - `import requests` must work with charset_normalizer installed and chardet
+    absent, and Response.apparent_encoding must detect encodings through it.
+  - chardet remains a supported escape hatch: if it *is* installed it should
+    still be preferred, and it must remain an optional dependency rather than a
+    required one.
+  - The startup dependency-version check in requests/__init__.py currently
+    asserts a chardet version unconditionally. It must accept a supported
+    charset_normalizer (>=2.0.0,<3.0.0) instead, and must not emit a
+    RequestsDependencyWarning for the installed, supported versions.
+  - requests.packages keeps its backwards-compatibility aliases:
+    requests.packages.chardet must still resolve to whichever detector is in use.
+
+setup:
+  # --no-deps deliberately: setup.py at this commit still lists chardet as a hard
+  # requirement, and installing it would remove the very thing the task is about.
+  # The runtime deps are therefore pinned here by hand, exactly (not "latest") --
+  # floating installs are a supply-chain risk and a reproducibility hazard.
+  - pip install --no-input --no-deps -e .
+  - pip install --no-input urllib3==1.26.20 idna==2.10 certifi==2024.8.30
+  - pip install --no-input charset_normalizer==2.0.12
+  - pip install --no-input pytest==8.3.3
+
+# Almost nothing runs before the migration, since importing requests fails. This
+# is the smallest honest signal of progress: it goes from collection error to
+# passing the moment the import is fixed.
+public_tests: pytest tests/test_structures.py -q
+
+# Real upstream migration: https://github.com/psf/requests/commit/2ed84f55 (PR #5797)
+hidden_tests: pytest tests/test_charset_normalizer_migration.py -q
+
+hidden_test_files:
+  - tests/test_charset_normalizer_migration.py
+
+# The upstream migration; `commit` above is its parent. Used by Tasks.verify.
+reference_commit: "2ed84f55b22f19a1e1e8eea2e50963dce62052d3"
+reference_paths:
+  - requests/__init__.py
+  - requests/compat.py
+  - requests/help.py
+  - requests/models.py
+  - requests/packages.py
+
+expected_behavior: |
+  With charset_normalizer 2.0.12 installed and chardet absent: `import requests`
+  succeeds and raises no RequestsDependencyWarning; requests.compat.chardet is
+  the charset_normalizer module; requests.packages.chardet resolves to it too;
+  and Response.apparent_encoding returns "utf-8" for UTF-8 encoded content.
+
+resource_limit:
+  cpus: 2.0
+  memory_gb: 2.0
+  timeout_seconds: 300
+  pids_limit: 100
+  # Setup needs PyPI for the pinned replacement dependencies. Encoding detection
+  # is local work; no test command opens a socket.
+  network_enabled: true
