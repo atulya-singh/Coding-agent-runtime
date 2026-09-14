@@ -37,6 +37,11 @@ setup:
   - pip install --no-input -e .
   - pip install --no-input pytest==8.3.3
 
+# Phase 4 Build stage: is the patched tree runnable at all? Importing the package
+# is a far stronger check here than byte-compiling it -- requests wires up its
+# dependency checks and its charset backend at import time.
+build: python -c "import requests; print(requests.__version__)"
+
 # Existing adapter tests -- small, network-free, and the agent's fastest check
 # that it hasn't disturbed adapter behavior.
 public_tests: pytest tests/test_adapters.py -q
@@ -50,6 +55,13 @@ hidden_test_files:
 # "...while preserving existing behavior" is half the task, so the preserved half
 # is graded too. Without this, gutting adapters.py would pass the new-API tests.
 regression_tests: pytest tests/test_adapters.py tests/test_utils.py -q
+
+# What fraction of hidden_tests already passes on `commit`. Phase 4 subtracts
+# this before awarding partial credit, so an agent that changes nothing scores
+# zero rather than most of the marks.
+# 1 of the 11 hidden tests already passes; the other 10 need the new hook.
+# Measured by `python -m Tasks.verify`, which re-checks it on every run.
+baseline_hidden_pass_rate: 0.0909
 
 # The upstream change; `commit` above is its parent. Used by Tasks.verify.
 reference_commit: "a62a2d35d918baa8e793f7aa4fb41527644dfca5"

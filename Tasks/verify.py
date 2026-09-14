@@ -36,25 +36,38 @@ from __future__ import annotations
 
 import argparse
 import logging
-import re
 import shutil
-import statistics
-import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from Sandbox import Sandbox
 from Sandbox.manager import REPO_DIR
 
+from .harness import (
+    DEFAULT_REPO_CACHE,
+    ensure_repo,
+    export_commit,
+    file_at_commit,
+    measure_benchmark,
+    tail as _tail,
+)
 from .loader import discover_task_dirs, load_task
-from .schema import Benchmark, Task, TaskCategory
+from .schema import Task, TaskCategory
+
+# Imported from the grader on purpose: what this file checks is that each task
+# satisfies what Phase 4 needs from it, so it should read the output exactly the
+# way Phase 4 will.
+from Evaluation.pytest_report import parse_result
 
 DATASET_DIR = Path(__file__).parent / "dataset"
-DEFAULT_REPO_CACHE = Path(tempfile.gettempdir()) / "agent-runtime-task-repos"
 SETUP_TIMEOUT = 900.0
+
+#: Pass rates are exact fractions (8/13, 12/13); a few decimal places in the YAML
+#: is plenty, so allow the rounding but nothing more.
+BASELINE_TOLERANCE = 0.001
 
 # public_tests exist to give the agent a signal it can trust while working, so
 # they should already pass on the pre-change state. dependency_migration is the
@@ -82,46 +95,7 @@ class TaskReport:
         return [c for c in self.checks if not c.passed]
 
 
-# ---- host-side git helpers -------------------------------------------------
-
-
-def _git(repo: Path, *args: str, binary: bool = False):
-    result = subprocess.run(
-        ["git", "-C", str(repo), *args], capture_output=True, check=True
-    )
-    return result.stdout if binary else result.stdout.decode("utf-8", "replace")
-
-
-def ensure_repo(repository: str, cache_dir: Path, commits: List[str]) -> Path:
-    """Clone the upstream repo once and reuse it across tasks and re-runs."""
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    path = cache_dir / re.sub(r"[^A-Za-z0-9_.-]", "_", repository)
-    if not (path / ".git").exists():
-        print(f"  cloning {repository} (one time, into {path})")
-        subprocess.run(["git", "clone", "--quiet", repository, str(path)], check=True)
-    missing = [c for c in commits if subprocess.run(["git", "-C", str(path), "cat-file", "-e", f"{c}^{{commit}}"], capture_output=True).returncode != 0]
-    if missing:
-        subprocess.run(["git", "-C", str(path), "fetch", "--quiet", "--all", "--tags"], check=True)
-    return path
-
-
-def export_commit(repo: Path, commit: str, dest: Path) -> None:
-    """Materialise a commit as a plain directory -- no .git, nothing to leak."""
-    dest.mkdir(parents=True, exist_ok=True)
-    archive = _git(repo, "archive", commit, binary=True)
-    subprocess.run(["tar", "-x", "-C", str(dest)], input=archive, check=True)
-
-
-def file_at_commit(repo: Path, commit: str, path: str) -> bytes:
-    return _git(repo, "show", f"{commit}:{path}", binary=True)
-
-
 # ---- sandbox helpers -------------------------------------------------------
-
-
-def _tail(result, limit: int = 400) -> str:
-    text = (result.stdout or "") + (result.stderr or "")
-    return text.strip()[-limit:].replace("\n", " | ")
 
 
 def put_bytes(sandbox: Sandbox, content: bytes, repo_rel: str, staging: Path) -> None:
@@ -133,20 +107,6 @@ def put_bytes(sandbox: Sandbox, content: bytes, repo_rel: str, staging: Path) ->
 
 def put_local(sandbox: Sandbox, local: Path, repo_rel: str) -> None:
     sandbox.put_file(str(local), f"{REPO_DIR}/{repo_rel}")
-
-
-def measure(sandbox: Sandbox, benchmark: Benchmark, timeout: float) -> Tuple[Optional[float], str]:
-    """Median of benchmark.runs, so one scheduling hiccup can't decide a verdict."""
-    values = []
-    for _ in range(benchmark.runs):
-        result = sandbox.run_command(benchmark.command, timeout=timeout)
-        if not result.success:
-            return None, _tail(result)
-        try:
-            values.append(float(result.stdout.strip().splitlines()[-1]))
-        except (ValueError, IndexError):
-            return None, f"benchmark printed no float: {result.stdout.strip()[-200:]!r}"
-    return statistics.median(values), ""
 
 
 # ---- the per-task procedure ------------------------------------------------
@@ -201,8 +161,22 @@ def verify_task(task: Task, task_dir: Path, repo: Path, keep_logs: Optional[Path
                     "hidden tests already pass before the change" if result.success else _tail(result),
                 )
 
+                # Phase 4 subtracts this before awarding partial credit, so a
+                # stale value silently inflates every score the grader reports.
+                # Re-measuring it here means the check that proves the task is
+                # real also proves the number is.
+                counts = parse_result(result)
+                measured = counts.pass_rate if counts and counts.graded else 0.0
+                add(
+                    f"baseline_hidden_pass_rate is accurate (base scores {measured:.4f})",
+                    abs(measured - task.baseline_hidden_pass_rate) <= BASELINE_TOLERANCE,
+                    f"task.yaml records {task.baseline_hidden_pass_rate}, but the base "
+                    f"commit scores {measured:.4f} ({counts}) -- Phase 4 partial credit "
+                    f"is measured against this",
+                )
+
             if task.benchmark:
-                ratio, error = measure(sandbox, task.benchmark, timeout)
+                ratio, error = measure_benchmark(sandbox, task.benchmark, timeout)
                 add(
                     f"benchmark on base is above max_ratio ({task.benchmark.max_ratio})",
                     ratio is not None and ratio > task.benchmark.max_ratio,
@@ -240,7 +214,7 @@ def verify_task(task: Task, task_dir: Path, repo: Path, keep_logs: Optional[Path
                 add("regression_tests pass with reference", result.success, _tail(result))
 
             if task.benchmark:
-                ratio, error = measure(sandbox, task.benchmark, timeout)
+                ratio, error = measure_benchmark(sandbox, task.benchmark, timeout)
                 add(
                     f"benchmark with reference is at or below max_ratio ({task.benchmark.max_ratio})",
                     ratio is not None and ratio <= task.benchmark.max_ratio,

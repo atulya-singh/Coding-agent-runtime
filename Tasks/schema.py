@@ -104,6 +104,13 @@ class Task:
     # fed into the agent's context -- kept as separate fields/files for that reason.
     hidden_tests: str = ""
     hidden_test_files: List[str] = field(default_factory=list)
+    # What fraction of `hidden_tests` already passes on the base commit. A hidden
+    # suite usually covers the cases *around* the change as well as the new ones
+    # -- which is what stops a fix that breaks its neighbours -- so this is often
+    # well above zero. Phase 4 subtracts it before awarding partial credit;
+    # without that, an agent that changed nothing would score most of the marks.
+    # Measured and re-checked by `python -m Tasks.verify`, so it cannot drift.
+    baseline_hidden_pass_rate: float = 0.0
     # Must pass both before and after the change. public_tests are advisory and
     # agent-visible; these are graded, and catch a "solution" that satisfies
     # hidden_tests by breaking everything around it.
@@ -111,6 +118,16 @@ class Task:
     # `testing` tasks only: runs the tests the AGENT was asked to write. Graded
     # against `mutations` rather than by passing on its own.
     agent_tests: str = ""
+    # Phase 4's Build stage: does the patched tree run at all? A test result from
+    # a tree that doesn't import says nothing, so this gates everything after it
+    # and feeds the Build Success Rate metric. Defaults to byte-compiling the
+    # files the patch touched; set it to something stronger (importing the
+    # package under test) where the repository allows.
+    build: str = ""
+    # Extra objective checks run in the container at grading time. The built-in
+    # patch-level static checks always run; these are additive, and any non-zero
+    # exit fails the stage.
+    static_checks: List[str] = field(default_factory=list)
     benchmark: Optional[Benchmark] = None
     mutations: List[Mutation] = field(default_factory=list)
     # Provenance, and what makes the dataset self-checking. `reference_commit` is
@@ -153,8 +170,11 @@ class Task:
             "public_tests": self.public_tests,
             "hidden_tests": self.hidden_tests,
             "hidden_test_files": self.hidden_test_files,
+            "baseline_hidden_pass_rate": self.baseline_hidden_pass_rate,
             "regression_tests": self.regression_tests,
             "agent_tests": self.agent_tests,
+            "build": self.build,
+            "static_checks": self.static_checks,
             "benchmark": self.benchmark.to_dict() if self.benchmark else None,
             "mutations": [m.to_dict() for m in self.mutations],
             "reference_commit": self.reference_commit,
@@ -227,6 +247,13 @@ def validate_task(task: Task, task_dir: Optional[Path] = None) -> List[str]:
         errors.append("reference_commit is set but reference_paths is empty")
     if task.reference_commit == task.commit:
         errors.append("reference_commit must differ from commit (commit is the pre-change parent)")
+
+    if not 0.0 <= task.baseline_hidden_pass_rate < 1.0:
+        errors.append(
+            f"baseline_hidden_pass_rate must be in [0.0, 1.0), got "
+            f"{task.baseline_hidden_pass_rate}: at 1.0 the hidden tests already "
+            f"pass before the agent has done anything"
+        )
 
     if task.benchmark is not None:
         if task.benchmark.max_ratio <= 0:

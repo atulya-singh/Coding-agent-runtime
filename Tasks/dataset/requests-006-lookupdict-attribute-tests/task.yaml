@@ -30,6 +30,11 @@ setup:
   - pip install --no-input -e .
   - pip install --no-input pytest==8.3.3
 
+# Phase 4 Build stage: is the patched tree runnable at all? Importing the package
+# is a far stronger check here than byte-compiling it -- requests wires up its
+# dependency checks and its charset backend at import time.
+build: python -c "import requests; print(requests.__version__)"
+
 # The file the agent is extending. Running it is how the agent checks its work.
 public_tests: pytest tests/test_structures.py -q
 

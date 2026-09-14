@@ -17,6 +17,13 @@ description: |
 setup:
   - pip install -e .
 
+# Phase 4's Build stage: does the patched tree run at all? A test result from a
+# tree that doesn't import means nothing, so this gates every stage after it and
+# feeds the Build Success Rate metric. Prefer something that exercises import-time
+# work over a bare syntax check. Defaults to byte-compiling the files the patch
+# touched, which is much weaker.
+build: python -c "import mypackage"
+
 # Command the agent is allowed to run/see while working.
 public_tests: pytest tests/test_public.py -q
 
@@ -28,6 +35,14 @@ hidden_tests: pytest tests/test_hidden.py -q
 # sandboxed repo only at evaluation time, after the agent has finished.
 hidden_test_files:
   - test_hidden.py
+
+# What fraction of hidden_tests already passes on `commit`, before the agent has
+# done anything. Rarely 0: a good hidden suite also covers the cases around the
+# change, which is what stops a fix that breaks its neighbours. Phase 4 subtracts
+# this before awarding partial credit, so leaving it stale inflates every score.
+# `python -m Tasks.verify` re-measures it and fails if it disagrees, and prints
+# the true value in the failure -- so set it to 0.0, run verify, copy what it says.
+baseline_hidden_pass_rate: 0.0
 
 # Must pass BOTH before and after the change. public_tests are advisory and
 # agent-visible; these are graded, and stop a "solution" that satisfies
@@ -64,6 +79,13 @@ hidden_test_files:
 reference_commit: "1111111111111111111111111111111111111111"
 reference_paths:
   - src/pkg/thing.py
+
+# Extra objective checks run in the container at grading time; any non-zero exit
+# fails the Static Checks stage. The built-in patch-level checks (conflict
+# markers, left-behind debuggers, writes outside the repo) always run, so leave
+# this out unless the repository ships a checker of its own.
+# static_checks:
+#   - python -m mypackage._lint
 
 expected_behavior: |
   Free-text description of correct behavior, used as a supplementary signal (e.g.

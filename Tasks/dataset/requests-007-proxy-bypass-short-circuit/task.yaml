@@ -36,6 +36,11 @@ setup:
   # tree as it stood in Dec 2021, so it needs what the tree needed then.
   - pip install --no-input pytest-mock==3.14.0
 
+# Phase 4 Build stage: is the patched tree runnable at all? Importing the package
+# is a far stronger check here than byte-compiling it -- requests wires up its
+# dependency checks and its charset backend at import time.
+build: python -c "import requests; print(requests.__version__)"
+
 # Proxy-resolution unit tests -- the agent can run these to confirm the
 # short-circuit didn't change any answers.
 public_tests: pytest tests/test_utils.py -k proxies -q

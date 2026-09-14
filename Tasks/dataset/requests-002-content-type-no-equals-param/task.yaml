@@ -29,6 +29,11 @@ setup:
   - pip install --no-input -e .
   - pip install --no-input pytest==8.3.3
 
+# Phase 4 Build stage: is the patched tree runnable at all? Importing the package
+# is a far stronger check here than byte-compiling it -- requests wires up its
+# dependency checks and its charset backend at import time.
+build: python -c "import requests; print(requests.__version__)"
+
 # Adjacent, unaffected header-parsing test -- confirms the fix didn't break
 # unrelated dict-header parsing.
 public_tests: pytest tests/test_utils.py -k test_parse_dict_header -q
@@ -40,6 +45,14 @@ hidden_tests: pytest tests/test_utils.py -k "test__parse_content_type_header or 
 # (Phase 4) before running hidden_tests -- never shown to the agent during the run.
 hidden_test_files:
   - tests/test_utils.py
+
+# What fraction of hidden_tests already passes on `commit`. Phase 4 subtracts
+# this before awarding partial credit, so an agent that changes nothing scores
+# zero rather than most of the marks.
+# 8 of the 13 parametrized cases are pre-existing content-type cases that
+# already pass; only 5 are about this bug.
+# Measured by `python -m Tasks.verify`, which re-checks it on every run.
+baseline_hidden_pass_rate: 0.6154
 
 # The upstream fix itself; `commit` above is its parent. Used by Tasks.verify.
 reference_commit: "f0198e6dfc431a2293dc16e1b1e8fcddc910a7f3"

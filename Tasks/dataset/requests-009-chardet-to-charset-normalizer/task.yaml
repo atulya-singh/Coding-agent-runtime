@@ -39,6 +39,11 @@ setup:
   - pip install --no-input charset_normalizer==2.0.12
   - pip install --no-input pytest==8.3.3
 
+# Phase 4 Build stage: is the patched tree runnable at all? Importing the package
+# is a far stronger check here than byte-compiling it -- requests wires up its
+# dependency checks and its charset backend at import time.
+build: python -c "import requests; print(requests.__version__)"
+
 # Almost nothing runs before the migration, since importing requests fails. This
 # is the smallest honest signal of progress: it goes from collection error to
 # passing the moment the import is fixed.

@@ -45,6 +45,11 @@ setup:
   # Oct 2021, so it needs what the tree needed then.
   - pip install --no-input pytest-mock==3.14.0 cryptography==43.0.1 trustme==0.9.0
 
+# Phase 4 Build stage: is the patched tree runnable at all? Importing the package
+# is a far stronger check here than byte-compiling it -- requests wires up its
+# dependency checks and its charset backend at import time.
+build: python -c "import requests; print(requests.__version__)"
+
 # Existing proxy-handling unit tests -- the agent can run these while working.
 public_tests: pytest tests/test_utils.py -k proxies -q
 
@@ -60,6 +65,14 @@ hidden_test_files:
 # Without this, "delete requests/sessions.py" would satisfy a purely structural
 # check. The whole utils suite is network-free and covers the moved logic.
 regression_tests: pytest tests/test_utils.py -q
+
+# What fraction of hidden_tests already passes on `commit`. Phase 4 subtracts
+# this before awarding partial credit, so an agent that changes nothing scores
+# zero rather than most of the marks.
+# 1 of the 12 hidden tests already passes -- the one asserting the resolved
+# mapping is unchanged, which is true before the extraction too.
+# Measured by `python -m Tasks.verify`, which re-checks it on every run.
+baseline_hidden_pass_rate: 0.0833
 
 # The upstream refactor; `commit` above is its parent. Used by Tasks.verify.
 reference_commit: "99b3b492418d0751ca960178d274f89805095e4c"
