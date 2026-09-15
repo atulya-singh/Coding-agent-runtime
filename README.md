@@ -89,16 +89,36 @@ generate -> tool_use blocks -> execute in the sandbox -> tool_result blocks -> g
 ```
 
 ```python
-from Agent import AgentConfig, AgentLoop, ModelClient, load_config
+from Agent import run_task, RunConfig
 
-config = load_config("Agent/config.yaml")
-client = ModelClient(config)                      # key via SecretBroker, host-side only
-run    = AgentLoop(task, toolset, client).run()   # toolset is a SandboxToolset
+run = run_task(task, task_dir, config=RunConfig(grade=True))
 
-run.stop_reason   # finished | finished_implicit | max_turns | budget | max_output_tokens | model_error
-run.tool_calls    # structured history, one entry per dispatched tool
-run.usage         # cumulative tokens; run.cost_usd when the model has configured rates
+run.agent.stop_reason   # finished | finished_implicit | max_turns | budget |
+                        # max_output_tokens | model_error | refusal | sandbox_gone
+run.agent.tool_calls    # structured history, one entry per dispatched tool
+run.agent.usage         # cumulative tokens; .cost_usd when the model has configured rates
+run.patch               # what the agent changed, as a diff against the base commit
+run.evaluation.outcome  # the Phase 4 grade, from a separate clean container
 ```
+
+`run_task` assembles what a real attempt needs around the loop: a pristine
+export of the base commit, a container, the task's setup steps, the toolhost,
+and the diff at the end. Each of those is a different kind of failure, and the
+record keeps them apart -- a container that would not build is not an agent that
+could not solve the task.
+
+From the command line:
+
+```
+python -m Agent requests-001-netrc-empty-default --grade
+python -m Agent requests-001-netrc-empty-default --dry-run   # spends nothing
+```
+
+Defaults -- model, thinking, effort, budgets, token rates -- come from
+`Agent/config.yaml`, so what a run was configured with is a file you can read
+rather than an argument someone remembered to pass. The API key is fetched
+host-side through `SecretBroker` and never enters a container; a free
+token-count call checks it, and the model id, before any container is built.
 
 There is no separate planning call and no separate verification call, on
 purpose. Planning-vs-direct-execution is one of the experiments this project
@@ -111,7 +131,7 @@ Every way a run can end is a named reason rather than a bare success flag. "The
 model said it was done", "it ran out of turns" and "the API returned 503" are
 three different events, and Principle 5 turns on not averaging them together.
 
-Two details that only look like details:
+Three details that only look like details:
 
 - **`finish` is a tool the loop answers itself.** The model needs a way to say
   "done" that is distinguishable from having nothing more to say. It is never
@@ -120,14 +140,25 @@ Two details that only look like details:
 - **Cost rates are configuration, not code.** A stale hardcoded price would
   quietly corrupt every cost number the project reports, so a model with no
   configured rates reports an unknown cost rather than zero, and a cost budget
-  without rates is rejected as unenforceable.
+  without rates is rejected as unenforceable. The rates shipped in
+  `Agent/config.yaml` are the published first-party ones, dated in the file.
+- **Three endings are not the agent's doing and are not counted as its
+  failures.** The API failing, the container tearing itself down after a command
+  timed out, and a safety classifier declining the request each stop the run
+  under their own name. Without that, a run that hit a 503 on turn one and a run
+  that tried for forty turns and failed would look identical in the results.
 
 Check the loop without spending a token -- every exit path, budget and
 malformed turn, against a scripted model and no container:
 
 ```
-python -m Agent.selftest
+python -m Agent.selftest --offline
 ```
+
+Without `--offline` it then runs the whole thing for real -- container, setup,
+toolhost, tool calls, diff, grade -- with a scripted agent replaying a task's
+known upstream fix. That still needs no API key: if it does not grade as solved,
+the wiring is wrong, because the patch is correct by construction.
 
 ## Objective evaluation
 

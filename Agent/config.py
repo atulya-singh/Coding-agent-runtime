@@ -16,15 +16,29 @@ import yaml
 
 from .pricing import ModelPricing
 
-DEFAULT_MODEL = "claude-sonnet-5"
+DEFAULT_MODEL = "claude-opus-5"
 CONFIG_FILENAME = "agent_config.yaml"
+
+
+#: Adaptive thinking is the only on-mode on the current models; `budget_tokens`
+#: is rejected by them. "off" omits the parameter's on-mode entirely.
+THINKING_MODES = ("adaptive", "off")
+#: output_config.effort. Unsupported on Haiku 4.5, which rejects the field.
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 
 
 @dataclass
 class AgentConfig:
     model: str = DEFAULT_MODEL
-    # Per-request output cap passed to the Messages API.
-    max_tokens: int = 4096
+    # Per-request output cap passed to the Messages API. A coding agent writes
+    # whole files in one block, and a turn cut off at max_tokens is thrown away
+    # (its last tool call may be truncated), so this is not a place to economise.
+    max_tokens: int = 16000
+    # How hard the model thinks before answering, and how deeply. Both are real
+    # experimental variables -- plan.md Phase 13 compares reasoning strategies --
+    # so they are recorded in config rather than hardcoded at the call site.
+    thinking: str = "adaptive"
+    effort: str = "high"
     # Hard stop on loop iterations. Also the denominator Phase 5's kill/resume
     # experiment uses for "10% of expected execution" -- see plan.md Phase 5.
     max_turns: int = 40
@@ -47,6 +61,8 @@ class AgentConfig:
         return {
             "model": self.model,
             "max_tokens": self.max_tokens,
+            "thinking": self.thinking,
+            "effort": self.effort,
             "max_turns": self.max_turns,
             "max_total_tokens": self.max_total_tokens,
             "max_cost_usd": self.max_cost_usd,
@@ -59,7 +75,9 @@ class AgentConfig:
         data = data or {}
         return cls(
             model=str(data.get("model", DEFAULT_MODEL)),
-            max_tokens=int(data.get("max_tokens", 4096)),
+            max_tokens=int(data.get("max_tokens", 16000)),
+            thinking=str(data.get("thinking", "adaptive")),
+            effort=str(data.get("effort", "high")),
             max_turns=int(data.get("max_turns", 40)),
             max_total_tokens=(
                 int(data["max_total_tokens"])
@@ -84,6 +102,14 @@ def validate_config(config: AgentConfig) -> List[str]:
         errors.append("model must be set")
     if config.max_tokens <= 0:
         errors.append(f"max_tokens must be positive, got {config.max_tokens}")
+    if config.thinking not in THINKING_MODES:
+        errors.append(
+            f"thinking must be one of {', '.join(THINKING_MODES)}, got {config.thinking!r}"
+        )
+    if config.effort and config.effort not in EFFORT_LEVELS:
+        errors.append(
+            f"effort must be one of {', '.join(EFFORT_LEVELS)}, got {config.effort!r}"
+        )
     if config.max_turns <= 0:
         errors.append(f"max_turns must be positive, got {config.max_turns}")
     if config.max_total_tokens is not None and config.max_total_tokens <= 0:

@@ -6,21 +6,32 @@ API key and no network. That matters because the expensive half of this system
 (a real model, a real container) is the worst place to discover that the loop
 mishandles a truncated turn or forgets to answer a tool_use block.
 
-    python -m Agent.selftest
+The live half then runs the whole thing for real -- container, setup, toolhost,
+tool calls, diff, grade -- with a scripted agent that replays the task's known
+upstream fix. It needs Docker but still no API key: if that run does not grade
+as solved, the wiring is wrong, because the patch is correct by construction.
+
+    python -m Agent.selftest              # offline checks, then one live task
+    python -m Agent.selftest --offline    # no Docker, no network
 """
 from __future__ import annotations
 
 import argparse
 import logging
 import sys
+from pathlib import Path
 from typing import List, Optional
 
+from Evaluation.result import Outcome
 from Evaluation.selftest import Checks
 from Execution.tools.base import ToolResult
+from Tasks.harness import DEFAULT_REPO_CACHE, ensure_repo, file_at_commit
+from Tasks.loader import discover_task_dirs, load_task
+from Sandbox.secrets import SecretBroker
 from Tasks.schema import Difficulty, Task, TaskCategory
 
-from .client import ModelError, ModelResponse
-from .config import AgentConfig, validate_config
+from .client import ModelClient, ModelError, ModelResponse
+from .config import DEFAULT_MODEL, AgentConfig, validate_config
 from .loop import (
     AgentLoop,
     StopReason,
@@ -31,7 +42,10 @@ from .loop import (
     zero_usage,
 )
 from .pricing import ModelPricing, cost_usd
+from .run import RunConfig, TaskRun, run_task
 from .tools import FINISH_TOOL_NAME, build_tool_specs
+
+DATASET_DIR = Path(__file__).parent.parent / "Tasks" / "dataset"
 
 # ---- doubles ---------------------------------------------------------------
 
@@ -74,6 +88,27 @@ class FakeToolset:
         if tool_name in self.results:
             return self.results[tool_name]
         return ToolResult(tool=tool_name, success=True, output=f"ran {tool_name}", duration_ms=1.0)
+
+
+class DyingToolset(FakeToolset):
+    """A FakeToolset whose sandbox tears itself down on the first call.
+
+    Sandbox.run_command destroys the container when a command times out, because
+    a killed `docker exec` leaves the process inside still running. Everything
+    after that point fails identically, which is the case this stands in for.
+    """
+
+    class _Sandbox:
+        container_id = "abc123"
+
+    def __init__(self):
+        super().__init__()
+        self.sandbox = self._Sandbox()
+
+    def call(self, tool_name, arguments=None) -> ToolResult:
+        result = super().call(tool_name, arguments)
+        self.sandbox.container_id = None
+        return ToolResult(tool=tool_name, success=False, error="command timed out")
 
 
 USAGE = {"input_tokens": 100, "output_tokens": 50}
@@ -249,7 +284,7 @@ def check_cost_budget(c: Checks) -> None:
     config = AgentConfig(
         max_turns=50,
         max_cost_usd=0.001,
-        pricing={"claude-sonnet-5": ModelPricing(input_per_mtok=3.0, output_per_mtok=15.0)},
+        pricing={DEFAULT_MODEL: ModelPricing(input_per_mtok=3.0, output_per_mtok=15.0)},
     )
     run, _, _ = run_loop([tool_turn("read_file", {"path": "a.py"})] * 10, config=config)
     c.equal("the cost budget stops the run", run.stop_reason, StopReason.BUDGET)
@@ -299,7 +334,7 @@ def check_config_guards(c: Checks) -> None:
     )
     priced = AgentConfig(
         max_cost_usd=5.0,
-        pricing={"claude-sonnet-5": ModelPricing(input_per_mtok=3.0, output_per_mtok=15.0)},
+        pricing={DEFAULT_MODEL: ModelPricing(input_per_mtok=3.0, output_per_mtok=15.0)},
     )
     c.equal("the same budget is fine once rates exist", validate_config(priced), [])
 
@@ -336,6 +371,129 @@ def check_prompt(c: Checks) -> None:
     c.check("the task description is the first user message", client.seen_messages[0][0]["content"] == "Fix the thing.")
 
 
+def check_refusal(c: Checks) -> None:
+    """A declined request is not an agent that decided it was finished."""
+    refused = ModelResponse(
+        content=[],
+        stop_reason="refusal",
+        usage=dict(USAGE),
+        stop_details={"type": "refusal", "category": "cyber", "explanation": "declined"},
+    )
+    run, _, _ = run_loop([refused, finish_turn()])
+    c.equal("a refusal is its own stop reason", run.stop_reason, StopReason.REFUSAL)
+    c.check("it is not read as the agent finishing", not run.stop_reason.is_agent_decision)
+    c.check("it is not blamed on the harness", not run.stop_reason.is_infrastructure)
+    c.check("the category is recorded", "cyber" in run.error)
+
+
+def check_request_shape(c: Checks) -> None:
+    """What actually goes on the wire, for the parameters the model rejects if
+    they are wrong."""
+    client = ModelClient(AgentConfig(), client=object())
+    kwargs = client.request_kwargs([{"role": "user", "content": "hi"}], [], "sys")
+    c.equal("adaptive thinking is requested", kwargs["thinking"], {"type": "adaptive"})
+    c.equal("effort rides inside output_config", kwargs["output_config"], {"effort": "high"})
+    c.check("the deprecated token budget is never sent", "budget_tokens" not in str(kwargs))
+
+    off = ModelClient(AgentConfig(thinking="off", effort=""), client=object())
+    bare = off.request_kwargs([], [], "")
+    c.check("turning them off omits them entirely", "thinking" not in bare and "output_config" not in bare)
+
+    c.equal(
+        "a missing key falls through to the SDK's own credential chain",
+        ModelClient._resolve_key(None, SecretBroker(lambda name: None)),
+        None,
+    )
+    c.equal(
+        "a brokered key is used when there is one",
+        ModelClient._resolve_key(None, SecretBroker(lambda name: "sk-test")),
+        "sk-test",
+    )
+
+    # Catches SDK drift without spending a request: a parameter the installed
+    # SDK does not accept is a 400 at the worst possible moment otherwise.
+    try:
+        import anthropic
+    except ImportError:
+        c.check("the SDK is not installed, so its signature is unchecked", True)
+        return
+    import inspect
+
+    accepted = set(
+        inspect.signature(anthropic.Anthropic(api_key="placeholder").messages.create).parameters
+    )
+    c.equal(
+        "every parameter sent is one the installed SDK accepts",
+        sorted(set(kwargs) - accepted),
+        [],
+    )
+
+
+def check_sandbox_gone(c: Checks) -> None:
+    """A dead container must end the run, not be talked to for 39 more turns."""
+    toolset = DyingToolset()
+    run, _, client = run_loop(
+        [tool_turn("run_tests", {"command": "pytest -q"}), finish_turn(), finish_turn()],
+        toolset=toolset,
+    )
+    c.equal("a torn-down sandbox stops the run", run.stop_reason, StopReason.SANDBOX_GONE)
+    c.equal("it stops on the turn it happened", run.turns, 1)
+    c.check("the model is not asked again", len(client.seen_messages) == 1)
+    c.check("the failed call is still answered", run.messages[-1]["role"] == "user")
+    c.check("the reason says what broke", "torn down" in run.error)
+
+
+def check_stop_reason_attribution(c: Checks) -> None:
+    """Principle 5 lives or dies on this split, so state it as a test."""
+    agent = {reason for reason in StopReason if reason.is_agent_decision}
+    infra = {reason for reason in StopReason if reason.is_infrastructure}
+    c.equal(
+        "the agent's own decisions are exactly finish + implicit finish",
+        agent,
+        {StopReason.FINISHED, StopReason.FINISHED_IMPLICIT},
+    )
+    c.equal(
+        "infrastructure failures are exactly the model error and the dead sandbox",
+        infra,
+        {StopReason.MODEL_ERROR, StopReason.SANDBOX_GONE},
+    )
+    c.check("nothing is counted as both", not (agent & infra))
+    c.check(
+        "hitting a limit we chose is a result, not a breakage",
+        not StopReason.MAX_TURNS.is_infrastructure
+        and not StopReason.BUDGET.is_infrastructure,
+    )
+
+
+def check_agent_record(c: Checks) -> None:
+    """What the grader will record about who attempted the task."""
+    run, _, _ = run_loop([tool_turn("read_file", {"path": "a.py"}), finish_turn("fixed it")])
+    record = TaskRun(task_id="t", model=run.model, agent=run).agent_record()
+    c.equal("the record names the model", record["model"], run.model)
+    c.equal("it carries the stop reason", record["stop_reason"], "finished")
+    c.check("it separates a decision from a limit", record["agent_decided_to_stop"] is True)
+    c.equal("it counts real tool calls only", record["tool_calls"], 1)
+    c.equal("it reports unknown cost as unknown", record["cost_usd"], None)
+    c.check("an empty run still produces a record", "model" in TaskRun(task_id="t").agent_record())
+
+
+def check_run_infrastructure(c: Checks) -> None:
+    """A broken harness must come back as a record, not an exception: a crash
+    here would be indistinguishable from an agent that failed the task."""
+    run = run_task(
+        sample_task(),
+        Path("/nonexistent-task-dir"),
+        client=ScriptedClient([finish_turn()]),
+        repo=Path("/nonexistent-repo"),
+        config=RunConfig(quiet=True),
+    )
+    c.check("a missing repository does not raise", isinstance(run, TaskRun))
+    c.check("it is recorded as infrastructure", bool(run.infrastructure_error))
+    c.check("no agent result is invented", run.agent is None)
+    c.check("the attempt is not counted as fair", not run.ok)
+    c.check("it is still serialisable", isinstance(run.to_dict(), dict))
+
+
 def run_offline(c: Checks) -> None:
     check_tool_specs(c)
     check_finish_path(c)
@@ -353,21 +511,121 @@ def run_offline(c: Checks) -> None:
     check_config_guards(c)
     check_output_handling(c)
     check_prompt(c)
+    check_refusal(c)
+    check_request_shape(c)
+    check_sandbox_gone(c)
+    check_stop_reason_attribution(c)
+    check_agent_record(c)
+    check_run_infrastructure(c)
+
+
+# ---- live: the same loop, a real container, a scripted agent ---------------
+
+
+def scripted_fix(task, repo) -> List[ModelResponse]:
+    """Turn the task's known-good upstream fix into agent-shaped tool calls.
+
+    The point is to exercise the wiring, not the model, so the "agent" here is
+    deterministic: look at the file, write the version upstream shipped, run the
+    public tests, call finish. If this run does not end SOLVED, the fault is in
+    the harness -- the patch is by construction the right one.
+    """
+    responses = [tool_turn("read_file", {"path": task.reference_paths[0]}, "tu_read")]
+    for index, rel_path in enumerate(task.reference_paths):
+        content = file_at_commit(repo, task.reference_commit, rel_path).decode("utf-8")
+        responses.append(
+            tool_turn("write_file", {"path": rel_path, "content": content}, f"tu_write_{index}")
+        )
+    responses.append(
+        tool_turn("run_tests", {"command": task.public_tests}, "tu_tests")
+    )
+    responses.append(finish_turn("applied the upstream fix"))
+    return responses
+
+
+def run_end_to_end(c: Checks, task_ids, dataset_dir: Path, repo_cache: Path) -> None:
+    tasks = [
+        (load_task(task_dir), task_dir)
+        for task_dir in discover_task_dirs(dataset_dir)
+        if not task_ids or load_task(task_dir).task_id in task_ids
+    ]
+    if not task_ids:
+        # One container per run; the whole dataset is the grader's job, not this one.
+        tasks = tasks[:1]
+
+    for task, task_dir in tasks:
+        repo = ensure_repo(
+            task.repository, repo_cache, [task.commit, task.reference_commit], quiet=True
+        )
+        client = ScriptedClient(scripted_fix(task, repo))
+        run = run_task(
+            task,
+            task_dir,
+            client=client,
+            repo=repo,
+            config=RunConfig(repo_cache=repo_cache, grade=True, quiet=True),
+        )
+
+        name = task.task_id
+        if not c.check(
+            f"{name}: the environment came up and the agent ran",
+            not run.infrastructure_error,
+            run.infrastructure_error,
+        ):
+            continue
+
+        c.equal(f"{name}: the run ended because finish was called", run.agent.stop_reason, StopReason.FINISHED)
+        c.check(f"{name}: the tools really executed in the container", len(run.agent.tool_calls) == len(client.seen_messages) - 1)
+        c.check(f"{name}: every tool call succeeded", all(call["success"] for call in run.agent.tool_calls))
+        c.check(f"{name}: the tools ran sandboxed", all(call["metadata"].get("sandboxed") for call in run.agent.tool_calls))
+        c.check(f"{name}: a diff was collected", run.patch is not None and not run.patch.is_empty)
+        c.equal(f"{name}: the diff covers exactly what was written", run.patch.files, sorted(task.reference_paths))
+        c.check(
+            f"{name}: setup's installed packages stayed out of the diff",
+            not any("egg-info" in path or "__pycache__" in path for path in run.patch.files),
+        )
+        c.equal(
+            f"{name}: the known-good fix grades as solved",
+            run.evaluation.outcome,
+            Outcome.SOLVED,
+        )
+        c.equal(
+            f"{name}: the grade records who attempted it",
+            run.evaluation.agent["stop_reason"],
+            "finished",
+        )
+
+
+# ---- entry point -----------------------------------------------------------
 
 
 def main(argv=None) -> int:
-    argparse.ArgumentParser(description=__doc__).parse_args(argv)
-    for name in ("agent.tools", "sandbox", "sandbox.docker"):
+    parser = argparse.ArgumentParser(
+        prog="python -m Agent.selftest", description=__doc__.splitlines()[0]
+    )
+    parser.add_argument("task_ids", nargs="*", help="end-to-end check only these tasks")
+    parser.add_argument("--offline", action="store_true", help="skip everything needing Docker")
+    parser.add_argument("--dataset", default=str(DATASET_DIR))
+    parser.add_argument("--repo-cache", default=str(DEFAULT_REPO_CACHE))
+    args = parser.parse_args(argv)
+
+    for name in ("agent.tools", "agent.run", "sandbox", "sandbox.docker", "evaluation"):
         logging.getLogger(name).setLevel(logging.CRITICAL)
 
     c = Checks()
     print("=== agent loop checks (no Docker, no API key)")
     run_offline(c)
 
+    if not args.offline:
+        print("\n=== end-to-end: real container, scripted agent, graded patch")
+        run_end_to_end(c, args.task_ids, Path(args.dataset), Path(args.repo_cache))
+
     total = len(c.results)
     failed = len(c.failures)
     print(f"\n{total - failed}/{total} checks passed")
     if failed:
+        for name, _, detail in c.failures:
+            print(f"  FAIL {name}" + (f"\n       {detail}" if detail else ""))
         return 1
     print("every exit path, budget and malformed turn is handled as intended")
     return 0

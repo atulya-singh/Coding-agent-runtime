@@ -32,6 +32,8 @@ class ModelResponse:
     content: List[dict] = field(default_factory=list)
     stop_reason: str = ""
     usage: dict = field(default_factory=dict)
+    #: Populated only when stop_reason is "refusal"; None otherwise.
+    stop_details: Optional[dict] = None
 
     def tool_use_blocks(self) -> List[dict]:
         return [block for block in self.content if block.get("type") == "tool_use"]
@@ -61,12 +63,35 @@ def _usage_dict(usage: Any) -> dict:
     }
 
 
+def _stop_details(details: Any) -> Optional[dict]:
+    """Only present on a refusal, and null for every other stop reason."""
+    if details is None:
+        return None
+    return details if isinstance(details, dict) else details.model_dump()
+
+
 class ModelClient:
     """Wraps the Anthropic Messages API for one run.
 
     `client` is injectable so the loop can be exercised against a scripted model
     with no API key and no network -- the seam the selftest uses.
     """
+
+    @staticmethod
+    def _resolve_key(api_key: Optional[str], broker: Optional[SecretBroker]) -> Optional[str]:
+        """Ask the broker for the key, and let the SDK try if it has none.
+
+        An unset ANTHROPIC_API_KEY does not mean there are no credentials: the
+        SDK also reads ANTHROPIC_AUTH_TOKEN and the profile written by
+        `ant auth login`. Returning None hands it that chain instead of failing
+        on a key the broker was never going to hold.
+        """
+        if api_key is not None:
+            return api_key
+        try:
+            return (broker or SecretBroker()).get_secret(API_KEY_NAME)
+        except KeyError:
+            return None
 
     def __init__(
         self,
@@ -81,26 +106,61 @@ class ModelClient:
         else:
             import anthropic  # imported lazily: the scripted path needs no SDK
 
-            key = api_key or (broker or SecretBroker()).get_secret(API_KEY_NAME)
             self._client = anthropic.Anthropic(
-                api_key=key,
+                api_key=self._resolve_key(api_key, broker),
                 timeout=self.config.request_timeout,
             )
+
+    def request_kwargs(self, messages: List[dict], tools: List[dict], system: str) -> dict:
+        """Everything sent to the API, as one dict -- so the request that produced
+        a result can be inspected and recorded rather than reconstructed."""
+        kwargs = {
+            "model": self.config.model,
+            "max_tokens": self.config.max_tokens,
+            "system": system,
+            "tools": tools,
+            "messages": messages,
+        }
+        # Adaptive is the only on-mode the current models accept; the older
+        # fixed `budget_tokens` form is rejected by them.
+        if self.config.thinking == "adaptive":
+            kwargs["thinking"] = {"type": "adaptive"}
+        if self.config.effort:
+            kwargs["output_config"] = {"effort": self.config.effort}
+        return kwargs
+
+    def preflight(self) -> int:
+        """Prove the credentials and the model id work, before anything expensive.
+
+        Token counting is free and does not generate, so this costs nothing but
+        catches the failures worth catching early: no key, a key without access,
+        a mistyped model id, no network. Without it those surface only after a
+        container has been built and the task's setup has run.
+        """
+        try:
+            response = self._client.messages.count_tokens(
+                model=self.config.model,
+                messages=[{"role": "user", "content": "ping"}],
+            )
+        except Exception as exc:
+            raise ModelError(f"{type(exc).__name__}: {exc}") from exc
+        return getattr(response, "input_tokens", 0)
 
     def generate(self, messages: List[dict], tools: List[dict], system: str) -> ModelResponse:
         try:
             response = self._client.messages.create(
-                model=self.config.model,
-                max_tokens=self.config.max_tokens,
-                system=system,
-                tools=tools,
-                messages=messages,
+                **self.request_kwargs(messages, tools, system)
             )
         except Exception as exc:
+            # Kept as one type on purpose: from the loop's point of view every
+            # one of these is "the turn did not happen". The class name is
+            # preserved in the message so a rate limit stays distinguishable
+            # from a bad request when the record is read back.
             raise ModelError(f"{type(exc).__name__}: {exc}") from exc
 
         return ModelResponse(
             content=[_as_dict(block) for block in response.content],
             stop_reason=getattr(response, "stop_reason", "") or "",
             usage=_usage_dict(getattr(response, "usage", None)),
+            stop_details=_stop_details(getattr(response, "stop_details", None)),
         )

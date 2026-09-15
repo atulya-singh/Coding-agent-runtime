@@ -4,10 +4,22 @@
 # This describes how the loop talks to a model -- not what it's solving (that's
 # Tasks/dataset/<task_id>/task.yaml) -- so the same config can run any task.
 
-model: claude-sonnet-5
+model: claude-opus-5
 
-# Per-request output cap passed to the Messages API.
-max_tokens: 4096
+# Per-request output cap passed to the Messages API. A turn cut off here is
+# discarded rather than continued (its last tool call may be truncated), so
+# leave room: this agent writes whole files in a single content block.
+max_tokens: 16000
+
+# Adaptive thinking is the only on-mode on the current models -- the older
+# `budget_tokens` form is rejected by them. Set to `off` to omit it.
+thinking: adaptive
+
+# How much reasoning the model spends per turn: low | medium | high | xhigh | max.
+# `high` is the API default. `xhigh` is the recommended setting for coding and
+# agentic work and is worth trying on the harder task categories; it costs more
+# tokens per turn. Haiku 4.5 rejects this field entirely.
+effort: high
 
 # Hard stop on loop iterations (one iteration = one round of tool calls). Also
 # the denominator Phase 5's kill/resume experiment uses for "10% of expected
@@ -16,23 +28,36 @@ max_turns: 40
 
 # Cumulative budgets for the whole run, independent of max_turns -- a handful
 # of long turns can exhaust either well before max_turns is reached. Leave
-# null for unbounded.
+# null for unbounded. max_cost_usd requires a `pricing` entry for the model
+# below, since an unpriced run has no cost to compare against.
 max_total_tokens: null
 max_cost_usd: null
 
 # Per-request timeout, in seconds.
 request_timeout: 120.0
 
-# Token rates per model, in dollars per million tokens, copied from the
-# provider's pricing page. Deliberately empty: a stale or guessed rate here
-# would silently corrupt every cost number the project reports, and a model
-# with no entry reports an unknown cost instead of a free one. Setting
-# max_cost_usd above requires an entry for the model in use.
+# Token rates in dollars per million tokens. Rates are configuration, not code:
+# a stale number here would silently corrupt every cost figure the project
+# reports, and a model with no entry reports an unknown cost rather than a free
+# one. Check these against https://claude.com/pricing before trusting a cost
+# number in a paper -- they were taken from Anthropic's published first-party
+# rates and are correct as of 2026-06-24. Bedrock and Vertex bill differently.
 #
-# pricing:
-#   claude-sonnet-5:
-#     input_per_mtok: 0.00
-#     output_per_mtok: 0.00
-#     cache_write_per_mtok: 0.00   # optional; defaults to the input rate
-#     cache_read_per_mtok: 0.00    # optional; defaults to the input rate
-pricing: {}
+# Cache rates are not published per model as separate figures; these follow the
+# documented multipliers of the input rate (~1.25x to write, ~0.1x to read).
+pricing:
+  claude-opus-5:
+    input_per_mtok: 5.00
+    output_per_mtok: 25.00
+    cache_write_per_mtok: 6.25
+    cache_read_per_mtok: 0.50
+  claude-sonnet-5:
+    input_per_mtok: 2.00
+    output_per_mtok: 10.00
+    cache_write_per_mtok: 2.50
+    cache_read_per_mtok: 0.20
+  claude-haiku-4-5:
+    input_per_mtok: 1.00
+    output_per_mtok: 5.00
+    cache_write_per_mtok: 1.25
+    cache_read_per_mtok: 0.10

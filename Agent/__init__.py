@@ -11,6 +11,7 @@ from .config import (
 from .loop import AgentLoop, AgentRun, StopReason
 from .pricing import ModelPricing, cost_usd
 from .prompts import build_initial_messages, build_system_prompt
+from .run import RunConfig, TaskRun, run_task
 from .tools import FINISH_TOOL_NAME, FINISH_TOOL_SPEC, build_tool_specs
 
 __all__ = [
@@ -23,6 +24,9 @@ __all__ = [
     "AgentLoop",
     "AgentRun",
     "StopReason",
+    "run_task",
+    "RunConfig",
+    "TaskRun",
     "ModelClient",
     "ModelResponse",
     "ModelError",

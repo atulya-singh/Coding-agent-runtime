@@ -48,11 +48,29 @@ class StopReason(str, Enum):
     #: continuing from it would send the API a malformed request.
     MAX_OUTPUT_TOKENS = "max_output_tokens"
     MODEL_ERROR = "model_error"
+    #: A safety classifier declined the request. Deliberately in neither bucket
+    #: below: the harness did not break and the agent did not decide anything,
+    #: so the run measures nothing and belongs in neither rate.
+    REFUSAL = "refusal"
+    #: The container is gone -- Sandbox tears itself down when a command times
+    #: out, since a killed `docker exec` leaves the process inside still running.
+    #: Every later tool call would fail identically, so stop instead of spending
+    #: the remaining turns talking to a dead environment.
+    SANDBOX_GONE = "sandbox_gone"
 
     @property
     def is_agent_decision(self) -> bool:
         """Did the agent choose to stop, rather than being stopped?"""
         return self in (StopReason.FINISHED, StopReason.FINISHED_IMPLICIT)
+
+    @property
+    def is_infrastructure(self) -> bool:
+        """Did the harness break, rather than the agent fail? (Principle 5.)
+
+        MAX_TURNS and BUDGET are deliberately not here: those are limits this
+        project chose, and a run that hits one is a real result about the model.
+        """
+        return self in (StopReason.MODEL_ERROR, StopReason.SANDBOX_GONE)
 
 
 def zero_usage() -> dict:
@@ -134,6 +152,14 @@ def format_tool_output(result: ToolResult) -> str:
     return truncate(text) if text.strip() else "(no output)"
 
 
+def refusal_error(details: Optional[dict]) -> str:
+    """Say which classifier declined and why, rather than only that one did."""
+    details = details or {}
+    category = details.get("category") or "unspecified"
+    explanation = details.get("explanation") or ""
+    return f"the model declined the request (category: {category}) {explanation}".strip()
+
+
 def tool_result_block(tool_use_id: str, content: str, is_error: bool = False) -> dict:
     return {
         "type": "tool_result",
@@ -194,6 +220,9 @@ class AgentLoop:
             messages.append({"role": "assistant", "content": response.content})
             turns += 1
 
+            if response.stop_reason == "refusal":
+                return finish(StopReason.REFUSAL, error=refusal_error(response.stop_details))
+
             if response.stop_reason == "max_tokens":
                 return finish(StopReason.MAX_OUTPUT_TOKENS, error="model output hit max_tokens")
 
@@ -230,8 +259,28 @@ class AgentLoop:
 
             messages.append({"role": "user", "content": results})
 
+            # Checked before `finish`: if the container died, nothing the model
+            # says about being done can be acted on -- the diff can no longer be
+            # collected -- and the run must be attributed to the harness.
+            if self._sandbox_gone():
+                return finish(
+                    StopReason.SANDBOX_GONE,
+                    summary=summary or "",
+                    error="the sandbox was torn down (a command timed out)",
+                )
+
             if summary is not None:
                 return finish(StopReason.FINISHED, summary=summary)
+
+    def _sandbox_gone(self) -> bool:
+        """True once the toolset has no live container behind it.
+
+        Read through getattr so the loop still runs against any object exposing
+        `call`/`tool_specs` -- the scripted toolset the selftest uses has no
+        sandbox at all, and should not need to grow a fake one.
+        """
+        sandbox = getattr(self.toolset, "sandbox", None)
+        return sandbox is not None and getattr(sandbox, "container_id", "live") is None
 
     def _budget_exceeded(self, usage: dict) -> str:
         limit = self.config.max_total_tokens
