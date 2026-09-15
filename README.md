@@ -6,6 +6,7 @@ Building out this project in different stages:
 2. Sandbox : Disposable Docker container per task, with CPU/memory/pid/timeout limits, network off by default, and no credentials ever passed inside.
 3. Task dataset : Tasks mined from real upstream commits across all seven categories, each verified in a sandbox to be unsolved before the fix and solved after it.
 4. Objective evaluation : Grade an agent by replaying its patch onto a clean checkout and running build, tests, benchmarks, mutations and static checks -- never by asking a model whether the answer looks right.
+5. Agent loop : Drive a real model through the sandboxed tools -- generate, execute, feed the result back -- until it reports done or hits a turn, token or cost budget.
 
 ## Running tools in the sandbox
 
@@ -76,6 +77,57 @@ For each task this runs the base commit in a container, proves the criterion is
 it then is. For `performance` that means measuring the benchmark on both sides
 of the threshold; for `testing`, proving every mutation survives the old tests
 and dies to the new ones.
+
+## The agent loop
+
+`Agent` is the part that actually calls a model. One turn is: send the
+conversation, run whatever tools the model asked for inside the sandbox, send
+the results back.
+
+```
+generate -> tool_use blocks -> execute in the sandbox -> tool_result blocks -> generate
+```
+
+```python
+from Agent import AgentConfig, AgentLoop, ModelClient, load_config
+
+config = load_config("Agent/config.yaml")
+client = ModelClient(config)                      # key via SecretBroker, host-side only
+run    = AgentLoop(task, toolset, client).run()   # toolset is a SandboxToolset
+
+run.stop_reason   # finished | finished_implicit | max_turns | budget | max_output_tokens | model_error
+run.tool_calls    # structured history, one entry per dispatched tool
+run.usage         # cumulative tokens; run.cost_usd when the model has configured rates
+```
+
+There is no separate planning call and no separate verification call, on
+purpose. Planning-vs-direct-execution is one of the experiments this project
+exists to measure, so building it in would foreclose the comparison; and asking
+a model to judge whether a tool did what it asked adds an opinion where there is
+already a fact -- the tool's own result, and the tests the model can run itself.
+Principle 1 applies inside the loop, not only at grading time.
+
+Every way a run can end is a named reason rather than a bare success flag. "The
+model said it was done", "it ran out of turns" and "the API returned 503" are
+three different events, and Principle 5 turns on not averaging them together.
+
+Two details that only look like details:
+
+- **`finish` is a tool the loop answers itself.** The model needs a way to say
+  "done" that is distinguishable from having nothing more to say. It is never
+  dispatched to the sandbox, and a toolset that defines its own `finish` is
+  rejected rather than silently shadowed.
+- **Cost rates are configuration, not code.** A stale hardcoded price would
+  quietly corrupt every cost number the project reports, so a model with no
+  configured rates reports an unknown cost rather than zero, and a cost budget
+  without rates is rejected as unenforceable.
+
+Check the loop without spending a token -- every exit path, budget and
+malformed turn, against a scripted model and no container:
+
+```
+python -m Agent.selftest
+```
 
 ## Objective evaluation
 

@@ -8,11 +8,13 @@ budget attempted it.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import yaml
+
+from .pricing import ModelPricing
 
 DEFAULT_MODEL = "claude-sonnet-5"
 CONFIG_FILENAME = "agent_config.yaml"
@@ -33,6 +35,13 @@ class AgentConfig:
     max_cost_usd: Optional[float] = None
     # Per-request timeout, in seconds.
     request_timeout: float = 120.0
+    # Token rates per model, keyed by model id. Not hardcoded in pricing.py: see
+    # that module for why. A model missing here reports an unknown cost rather
+    # than a zero one.
+    pricing: Dict[str, ModelPricing] = field(default_factory=dict)
+
+    def pricing_for_model(self) -> Optional[ModelPricing]:
+        return self.pricing.get(self.model)
 
     def to_dict(self) -> dict:
         return {
@@ -42,6 +51,7 @@ class AgentConfig:
             "max_total_tokens": self.max_total_tokens,
             "max_cost_usd": self.max_cost_usd,
             "request_timeout": self.request_timeout,
+            "pricing": {name: rates.to_dict() for name, rates in self.pricing.items()},
         }
 
     @classmethod
@@ -60,6 +70,10 @@ class AgentConfig:
                 float(data["max_cost_usd"]) if data.get("max_cost_usd") is not None else None
             ),
             request_timeout=float(data.get("request_timeout", 120.0)),
+            pricing={
+                name: ModelPricing.from_dict(rates)
+                for name, rates in (data.get("pricing") or {}).items()
+            },
         )
 
 
@@ -76,8 +90,15 @@ def validate_config(config: AgentConfig) -> List[str]:
         errors.append(
             f"max_total_tokens must be positive when set, got {config.max_total_tokens}"
         )
-    if config.max_cost_usd is not None and config.max_cost_usd <= 0:
-        errors.append(f"max_cost_usd must be positive when set, got {config.max_cost_usd}")
+    if config.max_cost_usd is not None:
+        if config.max_cost_usd <= 0:
+            errors.append(f"max_cost_usd must be positive when set, got {config.max_cost_usd}")
+        elif config.pricing_for_model() is None:
+            # The budget would never trigger: cost is unknown without rates.
+            errors.append(
+                f"max_cost_usd is set but no pricing is configured for model "
+                f"'{config.model}'; add it under `pricing` or unset the budget"
+            )
     if config.request_timeout <= 0:
         errors.append(f"request_timeout must be positive, got {config.request_timeout}")
     return errors

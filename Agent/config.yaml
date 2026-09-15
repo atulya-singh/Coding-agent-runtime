@@ -22,3 +22,17 @@ max_cost_usd: null
 
 # Per-request timeout, in seconds.
 request_timeout: 120.0
+
+# Token rates per model, in dollars per million tokens, copied from the
+# provider's pricing page. Deliberately empty: a stale or guessed rate here
+# would silently corrupt every cost number the project reports, and a model
+# with no entry reports an unknown cost instead of a free one. Setting
+# max_cost_usd above requires an entry for the model in use.
+#
+# pricing:
+#   claude-sonnet-5:
+#     input_per_mtok: 0.00
+#     output_per_mtok: 0.00
+#     cache_write_per_mtok: 0.00   # optional; defaults to the input rate
+#     cache_read_per_mtok: 0.00    # optional; defaults to the input rate
+pricing: {}
