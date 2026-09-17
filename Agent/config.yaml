@@ -57,6 +57,31 @@ retry:
   jitter: true
   respect_retry_after: true
 
+# What the harness says back when the *agent* is the problem, rather than the
+# environment (Recovery Strategy B). Three cases: a tool call that does not fit
+# its schema, the same call producing the same result over and over, and one
+# tool failing the same way however the arguments are varied.
+#
+# A repeat only counts when the call and its result are both identical, so the
+# ordinary edit-test-edit cycle is never flagged -- running the tests twice is
+# how the job gets done, and it is only a loop when the output does not change.
+#
+# After max_nudges warnings about the same thing the run stops with
+# `agent_loop` rather than spending its remaining turns proving the point. An
+# agent that cannot get itself unstuck has failed the task, and that is a
+# result worth recording rather than a budget worth burning.
+#
+# enabled: false is the control arm for plan.md's Experiment 3 -- failures
+# still reach the model as ordinary tool results, but the harness stays quiet
+# and never ends a run for looping.
+context:
+  enabled: true
+  repeat_threshold: 3
+  failure_threshold: 3
+  max_nudges: 2
+  window: 12
+  validate_tool_calls: true
+
 # Token rates in dollars per million tokens. Rates are configuration, not code:
 # a stale number here would silently corrupt every cost figure the project
 # reports, and a model with no entry reports an unknown cost rather than a free

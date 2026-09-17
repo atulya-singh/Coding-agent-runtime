@@ -30,7 +30,9 @@ from uuid import uuid4
 #: 2: `retries` added. A v1 record would read back as "no retries", which is a
 #: claim about the environment it never actually made -- and resuming from one
 #: would silently reset a count the recovered run then continues from zero.
-CHECKPOINT_VERSION = 2
+#: 3: `interventions` added, for the same reason on the other side of the
+#: split -- what the harness had to tell the agent about its own behaviour.
+CHECKPOINT_VERSION = 3
 
 #: Status of a checkpoint taken mid-run. Every other value is an Agent.loop
 #: StopReason -- the two share one field so that "still going" and "ended, here
@@ -82,6 +84,9 @@ class Checkpoint:
     #: RetryAttempt dicts). Carried across a resume so the recovered run's
     #: record covers the whole attempt, not just the part after the crash.
     retries: List[dict] = field(default_factory=list)
+    #: What the harness told the agent about its own behaviour (Recovery
+    #: Guidance dicts): rejected tool calls, loops, repeated failures.
+    interventions: List[dict] = field(default_factory=list)
 
     patch_sha256: str = ""
     patch_meta: dict = field(default_factory=dict)
@@ -123,6 +128,7 @@ class Checkpoint:
             "usage": self.usage,
             "turns": self.step,
             "retries": self.retries,
+            "interventions": self.interventions,
         }
 
     def filename_stem(self) -> str:
@@ -148,6 +154,7 @@ class Checkpoint:
             "summary": self.summary,
             "error": self.error,
             "retries": self.retries,
+            "interventions": self.interventions,
             "patch_sha256": self.patch_sha256,
             "patch_meta": self.patch_meta,
             "patch_error": self.patch_error,
@@ -176,6 +183,7 @@ class Checkpoint:
             summary=str(data.get("summary", "")),
             error=str(data.get("error", "")),
             retries=data.get("retries") or [],
+            interventions=data.get("interventions") or [],
             patch_sha256=str(data.get("patch_sha256", "")),
             patch_meta=data.get("patch_meta") or {},
             patch_error=str(data.get("patch_error", "")),
@@ -189,6 +197,8 @@ class Checkpoint:
             line += f"  {len(self.patch_meta['files'])} file(s) changed"
         if self.retries:
             line += f"  {len(self.retries)} retried"
+        if self.interventions:
+            line += f"  {len(self.interventions)} nudged"
         if self.patch_error:
             line += f"  !! {self.patch_error[:60]}"
         return line

@@ -8,7 +8,7 @@ Building out this project in different stages:
 4. Objective evaluation : Grade an agent by replaying its patch onto a clean checkout and running build, tests, benchmarks, mutations and static checks -- never by asking a model whether the answer looks right.
 5. Agent loop : Drive a real model through the sandboxed tools -- generate, execute, feed the result back -- until it reports done or hits a turn, token or cost budget.
 6. State and checkpointing : Write every turn to disk -- the conversation and the diff so far -- so a run killed partway can be rebuilt in a fresh container and finished, and graded the same way an uninterrupted one is.
-7. Recovery : Absorb the failures that say nothing about the agent -- a model call that times out, drops, or comes back rate-limited -- by retrying with an exponential backoff, and record every one so a run that needed working around never passes for a clean one.
+7. Recovery : Absorb the failures that say nothing about the agent -- a model call that times out, drops, or comes back rate-limited -- by retrying with an exponential backoff; and hand back the ones only the agent can fix -- a malformed tool call, a loop, a command failing the same way every time -- as something it is actually told. Record both, so a run that needed working around never passes for a clean one.
 
 ## Running tools in the sandbox
 
@@ -96,7 +96,8 @@ from Agent import run_task, RunConfig
 run = run_task(task, task_dir, config=RunConfig(grade=True))
 
 run.agent.stop_reason   # finished | finished_implicit | max_turns | budget |
-                        # max_output_tokens | model_error | refusal | sandbox_gone
+                        # max_output_tokens | model_error | refusal | sandbox_gone |
+                        # agent_loop
 run.agent.tool_calls    # structured history, one entry per dispatched tool
 run.agent.usage         # cumulative tokens; .cost_usd when the model has configured rates
 run.patch               # what the agent changed, as a diff against the base commit
@@ -243,7 +244,20 @@ directory. A new store reads it, a new container is built, the run finishes, and
 it grades `SOLVED`. That is the work surviving a boundary nothing in memory
 crossed.
 
-## Retrying what is worth retrying
+## Recovering from failure
+
+`Recovery` splits failures by who can do anything about them, and treats the two
+halves oppositely. A rate limit is not something an agent can act on, so telling
+it would only spend context -- those are absorbed silently. A malformed tool call
+is the opposite: the agent is the only thing that can fix it, so the failure is
+the message.
+
+```
+Strategy A  retry                 timeouts, dropped connections, 429s
+Strategy B  retry with context    bad tool calls, loops, repeated failures
+```
+
+### A: retrying what is worth retrying
 
 A model call that times out, loses its connection, or comes back `429` says
 nothing about whether the agent could solve the task. Letting one of those end a
@@ -291,6 +305,54 @@ print the exact schedule a given set of numbers produces. The Anthropic SDK's
 own retry layer is switched off at construction; two nested layers would make
 one recorded retry mean three real requests, and every count here would be
 wrong.
+
+### B: telling the agent what it did
+
+Three failures the agent caused and is the only thing that can fix:
+
+**A tool call that does not fit its schema** is checked before dispatch and
+answered with the contract it broke -- the missing argument, the one that was
+not recognised and what it probably meant, and the tool's real signature. The
+call never becomes a command, and the model gets a complaint written against the
+schema it was given rather than whatever `TypeError` the Python function behind
+it would have raised, which it has never seen.
+
+**The same call producing the same result, over and over.** A repeat only counts
+when the call *and its result* are identical, which is the whole reason this can
+be switched on safely: running the test suite four times is how the job gets
+done, and it is only a loop when the output does not change.
+
+**One tool failing the same way however the arguments are varied** -- three
+`edit_file` calls with different `old_string`s and the identical "no match" back.
+The repeat rule cannot see that one, and it is the clearest signal there is that
+the agent's model of the file is wrong.
+
+The harness speaks in its own text block after the tool results, prefixed
+`[harness]`, so tool output stays exactly what the tool said and a remark about
+the agent's behaviour is visibly not something a tool produced.
+
+Then it stops. After `max_nudges` warnings about the same thing, a run that is
+still going nowhere ends as `agent_loop` rather than spending thirty more turns
+proving it. That is a real result -- an agent that cannot get itself unstuck has
+failed the task -- so `agent_loop` sits with `max_turns` and `budget`: a limit
+this project chose, not the harness breaking and not the agent deciding.
+
+```
+call 1, 2   silent
+call 3      told
+call 4      told again
+call 5      run ends as agent_loop
+```
+
+Repeating something *harmless* is mentioned but never escalated: re-reading one
+file four times is wasteful, not broken. And an agent that says it is finished in
+the same turn it repeats itself gets to be finished -- the point is to stop a run
+going nowhere, not to override one that has arrived.
+
+`context.enabled: false` is the control arm for plan.md's Experiment 3. Failures
+still reach the model as ordinary tool results; the harness just never comments
+and never ends a run for looping. `python -m Recovery --config Agent/config.yaml`
+prints both policies and the exact call-by-call verdict the thresholds produce.
 
 ## Objective evaluation
 

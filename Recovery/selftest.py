@@ -27,6 +27,15 @@ from typing import List, Optional
 from Evaluation.selftest import Checks
 from Execution.tools.base import ToolTimeoutError
 
+from .context import (
+    HARNESS_PREFIX,
+    ContextAdvisor,
+    ContextPolicy,
+    call_failed,
+    describe_parameters,
+    validate_context_policy,
+    validate_tool_call,
+)
 from .failures import FailureType, classify, retry_after_seconds
 from .retry import (
     MAX_RETRY_AFTER,
@@ -523,6 +532,251 @@ def check_model_client(c: Checks) -> None:
     )
 
 
+# ---- Strategy B: retry with context ----------------------------------------
+
+
+SPECS = [
+    {
+        "name": "read_file",
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "write_file",
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["path", "content"],
+        },
+    },
+    {
+        "name": "search_code",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "max_results": {"type": "integer"},
+                "case_sensitive": {"type": "boolean"},
+            },
+            "required": ["query"],
+        },
+    },
+    # A spec that documents no properties, the way a minimal tool definition
+    # does. Nothing may be rejected against it.
+    {"name": "git_diff", "input_schema": {"type": "object"}},
+]
+
+
+class FakeResult:
+    """The four fields the advisor reads off a ToolResult."""
+
+    def __init__(self, success=True, output="out", error=None, metadata=None):
+        self.success = success
+        self.output = output
+        self.error = error
+        self.metadata = metadata or {}
+
+
+def check_tool_call_validation(c: Checks) -> None:
+    print("\n--- invalid tool calls")
+
+    c.equal("a good call passes", validate_tool_call("read_file", {"path": "a.py"}, SPECS), "")
+    c.equal(
+        "so does an optional argument",
+        validate_tool_call("search_code", {"query": "x", "max_results": 10}, SPECS),
+        "",
+    )
+    c.equal(
+        "a spec with no documented properties rejects nothing",
+        validate_tool_call("git_diff", {"anything": 1, "at": "all"}, SPECS),
+        "",
+    )
+
+    unknown = validate_tool_call("reed_file", {"path": "a.py"}, SPECS)
+    c.check("an unknown tool is named as such", "no tool called" in unknown, unknown)
+    c.check("with the nearest real one suggested", "read_file" in unknown, unknown)
+    c.check("and the full list", "write_file" in unknown and "git_diff" in unknown, unknown)
+
+    missing = validate_tool_call("write_file", {"path": "a.py"}, SPECS)
+    c.check("a missing required argument is named", "content" in missing, missing)
+    c.check("with the signature quoted back", "required" in missing, missing)
+
+    typo = validate_tool_call("read_file", {"pth": "a.py"}, SPECS)
+    c.check("an unknown argument is named", "pth" in typo, typo)
+    c.check("with the nearest real one suggested", "pth -> path" in typo, typo)
+    c.check("and the missing required one too", "missing required" in typo, typo)
+
+    wrong = validate_tool_call("search_code", {"query": "x", "max_results": "ten"}, SPECS)
+    c.check("a wrong type is named", "max_results must be a integer" in wrong, wrong)
+    c.equal(
+        "a boolean is not accepted as a number",
+        "max_results must be a integer, got a boolean"
+        in validate_tool_call("search_code", {"query": "x", "max_results": True}, SPECS),
+        True,
+    )
+    c.equal(
+        "but a real boolean field takes one",
+        validate_tool_call("search_code", {"query": "x", "case_sensitive": True}, SPECS),
+        "",
+    )
+    c.check(
+        "arguments that are not an object at all are rejected",
+        "takes an object" in validate_tool_call("read_file", "a.py", SPECS),
+    )
+
+    c.check(
+        "a tool's signature reads like a signature",
+        describe_parameters(SPECS[1]) == "expected path (string, required), content (string, required)",
+        describe_parameters(SPECS[1]),
+    )
+
+    print("\n--- rejection happens before dispatch")
+    advisor = ContextAdvisor(ContextPolicy(), SPECS)
+    rejected = advisor.check_call("write_file", {"path": "a.py"})
+    c.check("a bad call is refused", rejected is not None)
+    c.equal("named as an invalid tool call", rejected.failure, FailureType.INVALID_TOOL_CALL.value)
+    c.check("and marked as coming from the harness", rejected.message.startswith(HARNESS_PREFIX))
+    c.equal("a good call is not", advisor.check_call("read_file", {"path": "a.py"}), None)
+    c.equal(
+        "schema checks can be switched off",
+        ContextAdvisor(ContextPolicy(validate_tool_calls=False), SPECS).check_call("nope", {}),
+        None,
+    )
+    c.equal(
+        "and are skipped when there are no specs to check against",
+        ContextAdvisor(ContextPolicy(), []).check_call("nope", {}),
+        None,
+    )
+
+
+def check_loop_detection(c: Checks) -> None:
+    print("\n--- loops")
+    policy = ContextPolicy(repeat_threshold=3, max_nudges=2)
+    advisor = ContextAdvisor(policy, SPECS)
+
+    failing = FakeResult(success=False, error="old_string not found in a.py")
+    said = [advisor.observe("edit_file", {"path": "a.py"}, failing) for _ in range(5)]
+
+    c.equal("the first two identical failures pass without comment", said[:2], [None, None])
+    c.check("the third is called out", said[2] is not None)
+    c.equal("as a loop", said[2].failure, FailureType.AGENT_LOOP.value)
+    c.equal("counting the repeats", said[2].occurrences, 3)
+    c.check("the fourth is called out again", said[3] is not None and not said[3].escalate)
+    c.check("the fifth escalates", said[4] is not None and said[4].escalate)
+    c.check("and the advisor says so once", advisor.escalated is said[4])
+    c.check("the message says why the run is stopping", "being stopped" in said[4].message)
+    c.equal("every one is on the record", len(advisor.interventions), 3)
+
+    print("\n--- what is not a loop")
+    advisor = ContextAdvisor(policy, SPECS)
+    # The honest cycle: the same command, a different result each time. This is
+    # how the job gets done and must never be flagged.
+    for attempt in range(6):
+        said = advisor.observe("run_tests", {"command": "pytest -q"}, FakeResult(output=f"run {attempt}"))
+        if said is not None:
+            break
+    c.equal("the same command with changing output is never flagged", advisor.interventions, [])
+
+    advisor = ContextAdvisor(policy, SPECS)
+    for path in ("a.py", "b.py", "c.py", "d.py", "e.py"):
+        advisor.observe("read_file", {"path": path}, FakeResult(output=path))
+    c.equal("different arguments are never a repeat", advisor.interventions, [])
+
+    print("\n--- repeating something harmless")
+    advisor = ContextAdvisor(policy, SPECS)
+    said = [advisor.observe("read_file", {"path": "a.py"}, FakeResult(output="same")) for _ in range(6)]
+    c.check("re-reading the same file is mentioned", said[2] is not None)
+    c.check("  ...but never escalates: it is wasteful, not broken", advisor.escalated is None)
+    c.equal(
+        "  ...and is not repeated forever",
+        len([entry for entry in said if entry is not None]),
+        policy.max_nudges,
+    )
+
+    print("\n--- a command that keeps failing")
+    advisor = ContextAdvisor(ContextPolicy(failure_threshold=3, max_nudges=2), SPECS)
+    # Different arguments every time, the identical complaint back: the repeat
+    # rule cannot see this one, which is what the second detector is for.
+    said = [
+        advisor.observe("edit_file", {"old_string": f"v{i}"}, FakeResult(success=False, error="no match"))
+        for i in range(3)
+    ]
+    c.check("the same error under different arguments is caught", said[2] is not None)
+    c.equal("as a command failure", said[2].failure, FailureType.COMMAND_FAILURE.value)
+    c.check("naming the shared assumption", "assumption" in said[2].message, said[2].message)
+
+    print("\n--- a nonzero exit is a failure even when the tool worked")
+    ran = FakeResult(success=True, output={"exit_code": 1, "stdout": "", "stderr": "boom"})
+    c.check("a failing command counts as a failure", call_failed(ran))
+    c.check("a passing one does not", not call_failed(FakeResult(output={"exit_code": 0})))
+    c.check("nor does a plain successful tool", not call_failed(FakeResult()))
+    c.check("metadata carries it too", call_failed(FakeResult(metadata={"exit_code": 2})))
+
+    advisor = ContextAdvisor(policy, SPECS)
+    said = [advisor.observe("run_command", {"command": "make"}, ran) for _ in range(5)]
+    c.check("an identically failing command is a loop", said[2] is not None)
+    c.check("  ...and does escalate, unlike a harmless repeat", said[4].escalate)
+
+    print("\n--- the window")
+    narrow = ContextAdvisor(ContextPolicy(repeat_threshold=3, window=3), SPECS)
+    same = FakeResult(output="x")
+    narrow.observe("read_file", {"path": "a.py"}, same)
+    for path in ("b.py", "c.py", "d.py"):
+        narrow.observe("read_file", {"path": path}, FakeResult(output=path))
+    narrow.observe("read_file", {"path": "a.py"}, same)
+    narrow.observe("read_file", {"path": "a.py"}, same)
+    c.equal("repeats spread beyond the window are not a loop", narrow.interventions, [])
+
+    print("\n--- the control arm")
+    off = ContextAdvisor(ContextPolicy(enabled=False), SPECS)
+    for _ in range(10):
+        off.observe("edit_file", {"path": "a.py"}, failing)
+    c.equal("a disabled advisor says nothing", off.interventions, [])
+    c.equal("and never ends a run", off.escalated, None)
+    c.equal("nor rejects a call", off.check_call("nope", {}), None)
+    c.equal("but still watches", len(off.history), 10)
+
+
+def check_context_policy(c: Checks) -> None:
+    print("\n--- the context policy")
+    policy = ContextPolicy()
+    c.equal("roundtrips through a dict", ContextPolicy.from_dict(policy.to_dict()), policy)
+    c.equal("an absent block is the defaults", ContextPolicy.from_dict(None), ContextPolicy())
+    c.equal("a valid policy has no complaints", validate_context_policy(policy), [])
+    c.check(
+        "a threshold of 1 is rejected: the first call would be its own repeat",
+        validate_context_policy(ContextPolicy(repeat_threshold=1)),
+    )
+    c.check(
+        "a window smaller than the threshold is rejected",
+        validate_context_policy(ContextPolicy(repeat_threshold=5, window=3)),
+    )
+    c.check("negative nudges are rejected", validate_context_policy(ContextPolicy(max_nudges=-1)))
+
+    advisor = ContextAdvisor(ContextPolicy(repeat_threshold=2, max_nudges=0), SPECS)
+    failing = FakeResult(success=False, error="nope")
+    advisor.observe("edit_file", {}, failing)
+    said = advisor.observe("edit_file", {}, failing)
+    c.check("max_nudges 0 ends the run on the first repeat", said.escalate)
+
+    advisor = ContextAdvisor(ContextPolicy(), SPECS)
+    c.equal("an advisor with nothing to say says so", advisor.summary_line(), "no interventions")
+    advisor.observe("edit_file", {}, FakeResult(success=False, error="x"))
+    advisor.observe("edit_file", {}, FakeResult(success=False, error="x"))
+    advisor.observe("edit_file", {}, FakeResult(success=False, error="x"))
+    c.check("and summarises when it does", "repeated_call" in advisor.summary_line())
+
+    record = advisor.interventions[0]
+    c.check(
+        "interventions are JSON-native",
+        all(isinstance(value, (str, int, float, bool)) for value in record.values()),
+        str(record),
+    )
+
+
 def check_agent_config(c: Checks) -> None:
     print("\n--- the policy as agent configuration")
     from pathlib import Path
@@ -542,12 +796,27 @@ def check_agent_config(c: Checks) -> None:
         ["retry: max_retries must be zero or more, got -2"],
     )
 
+    c.equal("an agent has a context policy too", config.context, ContextPolicy())
+    c.equal(
+        "which also roundtrips",
+        AgentConfig.from_dict(config.to_dict()).context,
+        config.context,
+    )
+    c.equal(
+        "and is validated through the same errors",
+        validate_config(AgentConfig(context=ContextPolicy(max_nudges=-1))),
+        ["context: max_nudges must be zero or more, got -1"],
+    )
+
     shipped = Path(__file__).parent.parent / "Agent" / "config.yaml"
     if shipped.exists():
-        policy = load_config(shipped).retry
+        loaded = load_config(shipped)
+        policy = loaded.retry
         c.equal("the shipped config asks for five retries", policy.max_retries, 5)
         c.equal("  ...with the doubling schedule", policy.schedule(), [1.0, 2.0, 4.0, 8.0, 16.0])
         c.equal("  ...and no complaints", validate_policy(policy), [])
+        c.check("  ...and turns Strategy B on", loaded.context.enabled)
+        c.equal("  ...with no complaints either", validate_context_policy(loaded.context), [])
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -571,6 +840,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     check_retry_call(c)
     check_retry_log(c)
     check_model_client(c)
+    check_tool_call_validation(c)
+    check_loop_detection(c)
+    check_context_policy(c)
     check_agent_config(c)
 
     failures = c.failures

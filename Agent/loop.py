@@ -23,6 +23,7 @@ from typing import Callable, List, Optional
 
 from Execution.sandbox_tools import SandboxToolset
 from Execution.tools.base import ToolResult
+from Recovery.context import ContextAdvisor, ContextPolicy
 from Tasks.schema import Task
 
 from .client import ModelClient, ModelError
@@ -53,6 +54,12 @@ class StopReason(str, Enum):
     #: continuing from it would send the API a malformed request.
     MAX_OUTPUT_TOKENS = "max_output_tokens"
     MODEL_ERROR = "model_error"
+    #: The agent repeated itself past the point of learning anything, and kept
+    #: doing it after being told. Like MAX_TURNS and BUDGET this is a limit this
+    #: project chose -- the harness is fine and the agent did not decide to
+    #: stop, so it belongs in neither bucket below. It is a real result: an
+    #: agent that cannot get itself unstuck has failed the task.
+    AGENT_LOOP = "agent_loop"
     #: A safety classifier declined the request. Deliberately in neither bucket
     #: below: the harness did not break and the agent did not decide anything,
     #: so the run measures nothing and belongs in neither rate.
@@ -118,6 +125,11 @@ class AgentRun:
     #: dicts). A retried run looks identical to a clean one in every other
     #: field, so without this the environment always looks healthy.
     retries: List[dict] = field(default_factory=list)
+    #: Everything the harness told the agent about its own behaviour
+    #: (Recovery.Guidance dicts): rejected tool calls, loops, repeated
+    #: failures. The other half of the same question -- retries say what the
+    #: environment did to the run, these say what the harness did to the agent.
+    interventions: List[dict] = field(default_factory=list)
 
     @property
     def total_tokens(self) -> int:
@@ -136,6 +148,7 @@ class AgentRun:
             "summary": self.summary,
             "error": self.error,
             "retries": self.retries,
+            "interventions": self.interventions,
             "messages": self.messages,
         }
 
@@ -165,6 +178,7 @@ class Snapshot:
     summary: str = ""
     error: str = ""
     retries: List[dict] = field(default_factory=list)
+    interventions: List[dict] = field(default_factory=list)
 
     @property
     def is_terminal(self) -> bool:
@@ -219,6 +233,7 @@ class AgentLoop:
         config: Optional[AgentConfig] = None,
         on_turn: Optional[Callable[[Snapshot], None]] = None,
         resume_from: Optional[dict] = None,
+        advisor: Optional[ContextAdvisor] = None,
     ):
         self.task = task
         self.toolset = toolset
@@ -226,6 +241,13 @@ class AgentLoop:
         self.config = config or client.config
         self.system = build_system_prompt(task)
         self.tool_specs = build_tool_specs(toolset)
+        #: Recovery Strategy B. Built from config rather than injected in the
+        #: normal case, and given the same specs the model was given so its
+        #: complaints quote the contract the model actually saw. Pass
+        #: `ContextPolicy(enabled=False)` for the control arm.
+        self.advisor = advisor or ContextAdvisor(
+            getattr(self.config, "context", None) or ContextPolicy(), self.tool_specs
+        )
         #: Called at every turn boundary and once at the end. A plain callable
         #: rather than a checkpoint store, so persistence stays out of here.
         self.on_turn = on_turn
@@ -247,9 +269,17 @@ class AgentLoop:
         # that reported only its own would understate how much the environment
         # actually misbehaved, which is exactly what this field is for.
         prior_retries = list(prior.get("retries") or [])
+        # The advisor itself starts fresh on a resume: its history is keyed on
+        # tool *outputs*, and those are not kept on the record. The agent still
+        # sees every earlier nudge, because they are in the conversation it is
+        # handed back.
+        prior_interventions = list(prior.get("interventions") or [])
 
         def retries() -> List[dict]:
             return prior_retries + self._client_retries()
+
+        def interventions() -> List[dict]:
+            return prior_interventions + self.advisor.interventions
 
         def record(status: str, summary: str = "", error: str = "") -> None:
             if self.on_turn is None:
@@ -267,6 +297,7 @@ class AgentLoop:
                     summary=summary,
                     error=error,
                     retries=retries(),
+                    interventions=interventions(),
                 )
             )
 
@@ -284,6 +315,7 @@ class AgentLoop:
                 summary=summary,
                 error=error,
                 retries=retries(),
+                interventions=interventions(),
             )
 
         # Before the first call to the model: a run killed in its opening
@@ -318,20 +350,37 @@ class AgentLoop:
                 return finish(StopReason.FINISHED_IMPLICIT, summary=response.text())
 
             results = []
+            notes: List[str] = []
             summary = None
             for block in blocks:
-                if block.get("name") == FINISH_TOOL_NAME:
-                    summary = (block.get("input") or {}).get("summary", "")
+                name = block.get("name")
+                arguments = block.get("input") or {}
+                if name == FINISH_TOOL_NAME:
+                    summary = arguments.get("summary", "")
                     results.append(tool_result_block(block["id"], "acknowledged"))
                     continue
+
+                # Checked against the schema before it becomes a command. A
+                # call that cannot work is answered with the contract it broke,
+                # rather than with whatever the underlying function would have
+                # raised -- the model has seen the schema and has never seen
+                # the Python signature.
+                rejection = self.advisor.check_call(name, arguments)
+                if rejection is not None:
+                    tool_calls.append(
+                        self._tool_call_record(turns, name, arguments, rejection.message)
+                    )
+                    results.append(tool_result_block(block["id"], rejection.message, is_error=True))
+                    continue
+
                 # Sequential even when the model asks for several at once: they
                 # share one filesystem, and a read after a write must see it.
-                result = self.toolset.call(block.get("name"), block.get("input") or {})
+                result = self.toolset.call(name, arguments)
                 tool_calls.append(
                     {
                         "turn": turns,
-                        "tool": block.get("name"),
-                        "arguments": block.get("input") or {},
+                        "tool": name,
+                        "arguments": arguments,
                         "success": result.success,
                         "error": result.error,
                         "duration_ms": round(result.duration_ms, 2),
@@ -344,7 +393,16 @@ class AgentLoop:
                     )
                 )
 
-            messages.append({"role": "user", "content": results})
+                guidance = self.advisor.observe(name, arguments, result)
+                if guidance is not None:
+                    notes.append(guidance.message)
+
+            # Harness notes go in their own text block after the tool results,
+            # never inside one: tool output stays exactly what the tool said,
+            # and a remark about the agent's behaviour is visibly not something
+            # a tool produced.
+            content = results + ([{"type": "text", "text": "\n\n".join(notes)}] if notes else [])
+            messages.append({"role": "user", "content": content})
 
             # Checked before `finish`: if the container died, nothing the model
             # says about being done can be acted on -- the diff can no longer be
@@ -359,9 +417,33 @@ class AgentLoop:
             if summary is not None:
                 return finish(StopReason.FINISHED, summary=summary)
 
+            # Checked after `finish`: an agent that announced it was done in the
+            # same turn it repeated itself gets to be done. Only a run that is
+            # still going and still going nowhere is stopped for it.
+            if self.advisor.escalated is not None:
+                return finish(
+                    StopReason.AGENT_LOOP,
+                    error=self.advisor.escalated.message,
+                )
+
             # Every tool_use is answered and the container is alive: the first
             # point since the last one where this run could be picked up again.
             record(IN_PROGRESS)
+
+    @staticmethod
+    def _tool_call_record(turn: int, name, arguments: dict, error: str) -> dict:
+        """A call the harness refused. On the record like any other, because the
+        model did make it -- `dispatched` is what separates the two."""
+        return {
+            "turn": turn,
+            "tool": name,
+            "arguments": arguments,
+            "success": False,
+            "error": error,
+            "duration_ms": 0.0,
+            "metadata": {},
+            "dispatched": False,
+        }
 
     def _client_retries(self) -> List[dict]:
         """What the model client has retried so far, if it keeps a log.

@@ -86,6 +86,18 @@ def sample_checkpoint(**overrides) -> Checkpoint:
                 "at": "2026-09-17T00:00:00+00:00",
             }
         ],
+        interventions=[
+            {
+                "failure": "agent_loop",
+                "reason": "repeated_call",
+                "message": "[harness] you have called run_tests 3 times",
+                "tool": "run_tests",
+                "occurrences": 3,
+                "nudge": 1,
+                "escalate": False,
+                "at": "2026-09-17T00:00:00+00:00",
+            }
+        ],
         patch_text="diff --git a/x.py b/x.py\n",
         patch_sha256="deadbeef",
         patch_meta={"files": ["x.py"]},
@@ -166,14 +178,16 @@ def check_no_drift_from_the_loop(c: Checks) -> None:
 def check_resume_state(c: Checks) -> None:
     state = sample_checkpoint().resume_state()
     c.equal(
-        "the loop is handed exactly the five keys it reads",
+        "the loop is handed exactly the six keys it reads",
         sorted(state),
-        ["messages", "retries", "tool_calls", "turns", "usage"],
+        ["interventions", "messages", "retries", "tool_calls", "turns", "usage"],
     )
     c.equal("the step becomes the turn count", state["turns"], 3)
-    # Otherwise a recovered run restarts its retry count at zero and the record
-    # understates how badly the environment was behaving.
+    # Otherwise a recovered run restarts these counts at zero and the record
+    # understates both how badly the environment behaved and how much the
+    # agent had to be corrected.
     c.equal("retries absorbed before the crash are handed back", len(state["retries"]), 1)
+    c.equal("so are the corrections the agent was given", len(state["interventions"]), 1)
 
 
 def check_store(c: Checks) -> None:

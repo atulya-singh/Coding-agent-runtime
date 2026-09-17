@@ -25,6 +25,7 @@ from typing import List, Optional
 from Evaluation.result import Outcome
 from Evaluation.selftest import Checks
 from Execution.tools.base import ToolResult
+from Recovery.context import ContextPolicy
 from Recovery.retry import RetryAttempt, RetryLog
 from Tasks.harness import DEFAULT_REPO_CACHE, ensure_repo, file_at_commit
 from Tasks.loader import discover_task_dirs, load_task
@@ -594,6 +595,198 @@ def check_retries_on_the_record(c: Checks) -> None:
     )
 
 
+class StrictToolset(FakeToolset):
+    """A FakeToolset whose specs actually document their arguments, so a call
+    can be wrong in the way a real one can."""
+
+    SPECS = [
+        {
+            "name": "read_file",
+            "description": "",
+            "input_schema": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+        {
+            "name": "edit_file",
+            "description": "",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_string": {"type": "string"},
+                    "new_string": {"type": "string"},
+                },
+                "required": ["path", "old_string", "new_string"],
+            },
+        },
+    ]
+
+
+def _edit_turn(index: int) -> ModelResponse:
+    return tool_turn(
+        "edit_file",
+        {"path": "a.py", "old_string": "x", "new_string": "y"},
+        f"tu_edit_{index}",
+    )
+
+
+def _blocks(run, role: str, kind: str) -> List[dict]:
+    return [
+        block
+        for message in run.messages
+        if message["role"] == role and isinstance(message["content"], list)
+        for block in message["content"]
+        if block.get("type") == kind
+    ]
+
+
+def check_invalid_tool_calls(c: Checks) -> None:
+    """A call that cannot work is answered with the schema, not dispatched."""
+    toolset = StrictToolset()
+    run, _, _ = run_loop(
+        [tool_turn("read_file", {"file": "a.py"}), finish_turn("ok")], toolset=toolset
+    )
+    c.equal("a call that does not fit its schema never reaches the toolset", toolset.calls, [])
+    c.equal("it is still on the record as a call the model made", len(run.tool_calls), 1)
+    c.check("marked as never dispatched", run.tool_calls[0]["dispatched"] is False)
+    c.equal("and recorded as an intervention", len(run.interventions), 1)
+    c.equal("named for what it was", run.interventions[0]["reason"], "invalid_tool_call")
+
+    answer = _blocks(run, "user", "tool_result")[0]
+    c.check("the model is told the argument was missing", "missing required" in answer["content"])
+    c.check("and which one it did not recognise", "unknown argument" in answer["content"])
+    c.check("and what the tool actually takes", "expected path (string" in answer["content"])
+    c.check("as an error, so the model does not read it as output", answer["is_error"])
+    c.equal("the run is otherwise unaffected", run.stop_reason, StopReason.FINISHED)
+
+    toolset = StrictToolset()
+    run, _, _ = run_loop(
+        [tool_turn("reed_file", {"path": "a.py"}), finish_turn()], toolset=toolset
+    )
+    answer = _blocks(run, "user", "tool_result")[0]
+    c.check("a misspelled tool name gets the nearest real one", "read_file" in answer["content"])
+    c.check("and the full list of what exists", "edit_file" in answer["content"])
+    c.equal("and nothing is run", toolset.calls, [])
+
+
+def check_loop_detection(c: Checks) -> None:
+    """Being told is the recovery; being told twice and doing it again is a result."""
+    failing = ToolResult(tool="edit_file", success=False, error="old_string not found in a.py")
+    script = [_edit_turn(index) for index in range(8)] + [finish_turn("done")]
+
+    seen: List[Snapshot] = []
+    run, toolset, _ = run_loop(
+        list(script),
+        toolset=StrictToolset({"edit_file": failing}),
+        config=AgentConfig(max_turns=20),
+        on_turn=seen.append,
+    )
+    c.equal("a run that cannot get itself unstuck ends as a loop", run.stop_reason, StopReason.AGENT_LOOP)
+    c.equal("after two warnings and one more identical attempt", run.turns, 5)
+    c.check("the record says why", "being stopped" in run.error)
+    c.equal("with every warning kept", len(run.interventions), 3)
+    c.check("the last of which escalated", run.interventions[-1]["escalate"])
+    c.check("and none before it did", not any(entry["escalate"] for entry in run.interventions[:-1]))
+    c.equal("the terminal snapshot carries them too", len(seen[-1].interventions), 3)
+    c.equal(
+        "and the grader is told how many there were",
+        TaskRun(task_id="t", agent=run).agent_record()["interventions"],
+        3,
+    )
+    c.check("turns were saved rather than spent", run.turns < 9)
+
+    notes = _blocks(run, "user", "text")
+    c.equal("the harness speaks in its own block", len(notes), 3)
+    c.check("identified as the harness", all(note["text"].startswith("[harness]") for note in notes))
+    c.check(
+        "tool output is left exactly as the tool said it",
+        all("[harness]" not in block["content"] for block in _blocks(run, "user", "tool_result")),
+    )
+    for message in run.messages:
+        if message["role"] != "user" or not isinstance(message["content"], list):
+            continue
+        kinds = [block.get("type") for block in message["content"]]
+        if "text" in kinds and not c.check(
+            "every tool result comes before the note about it",
+            kinds.index("text") == len(kinds) - 1,
+            str(kinds),
+        ):
+            break
+
+    print()
+    off, toolset, _ = run_loop(
+        list(script),
+        toolset=StrictToolset({"edit_file": failing}),
+        config=AgentConfig(max_turns=20, context=ContextPolicy(enabled=False)),
+    )
+    c.equal("the control arm is never interrupted", off.stop_reason, StopReason.FINISHED)
+    c.equal("  ...and says nothing", off.interventions, [])
+    c.equal("  ...so the same script runs to the end", off.turns, 9)
+    c.check("  ...making the two comparable on one variable", run.turns != off.turns)
+
+    # An agent that announces it is done in the same turn it repeats itself
+    # gets to be done: the point is to stop a run going nowhere, not to
+    # override one that has arrived.
+    both = ModelResponse(
+        content=[
+            {
+                "type": "tool_use",
+                "id": "tu_edit_last",
+                "name": "edit_file",
+                "input": {"path": "a.py", "old_string": "x", "new_string": "y"},
+            },
+            {"type": "tool_use", "id": "tu_fin", "name": FINISH_TOOL_NAME, "input": {"summary": "done"}},
+        ],
+        stop_reason="tool_use",
+        usage=dict(USAGE),
+    )
+    finished, _, _ = run_loop(
+        [_edit_turn(index) for index in range(4)] + [both],
+        toolset=StrictToolset({"edit_file": failing}),
+        config=AgentConfig(max_turns=20),
+    )
+    c.equal("finishing beats escalating in the same turn", finished.stop_reason, StopReason.FINISHED)
+
+    c.check(
+        "looping is neither the harness breaking nor the agent deciding",
+        not StopReason.AGENT_LOOP.is_infrastructure
+        and not StopReason.AGENT_LOOP.is_agent_decision,
+    )
+
+
+def check_honest_repetition(c: Checks) -> None:
+    """The edit-test-edit cycle must never be mistaken for a loop."""
+    class ChangingToolset(StrictToolset):
+        def __init__(self):
+            super().__init__()
+            self.runs = 0
+
+        def call(self, tool_name, arguments=None):
+            self.calls.append((tool_name, arguments or {}))
+            self.runs += 1
+            # The same command, a different result each time: this is what
+            # making progress looks like.
+            return ToolResult(
+                tool=tool_name,
+                success=True,
+                output={"exit_code": 0, "stdout": f"{self.runs} passed"},
+                duration_ms=1.0,
+            )
+
+    script = [tool_turn("read_file", {"path": "a.py"}, f"tu_{i}") for i in range(8)]
+    run, _, _ = run_loop(
+        script + [finish_turn()],
+        toolset=ChangingToolset(),
+        config=AgentConfig(max_turns=20),
+    )
+    c.equal("a call whose result keeps changing is not a loop", run.interventions, [])
+    c.equal("so the run is left alone", run.stop_reason, StopReason.FINISHED)
+    c.equal("all nine turns ran", run.turns, 9)
+
+
 def run_offline(c: Checks) -> None:
     check_tool_specs(c)
     check_finish_path(c)
@@ -620,6 +813,9 @@ def run_offline(c: Checks) -> None:
     check_snapshots(c)
     check_resume(c)
     check_retries_on_the_record(c)
+    check_invalid_tool_calls(c)
+    check_loop_detection(c)
+    check_honest_repetition(c)
 
 
 # ---- live: the same loop, a real container, a scripted agent ---------------

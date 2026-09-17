@@ -118,6 +118,9 @@ def _describe(run: TaskRun) -> str:
         lines.append(
             f"  retried   {len(agent.retries)}x ({', '.join(kinds)}), {waited:.1f}s waited"
         )
+    if agent.interventions:
+        reasons = sorted({entry.get("reason", "?") for entry in agent.interventions})
+        lines.append(f"  told      {len(agent.interventions)}x ({', '.join(reasons)})")
     if run.patch is not None:
         lines.append(
             f"  patch     {len(run.patch.files)} file(s), "

@@ -71,6 +71,7 @@ class CheckpointRecorder:
             summary=snapshot.summary,
             error=snapshot.error,
             retries=snapshot.retries,
+            interventions=snapshot.interventions,
             patch_sha256=patch_sha,
             patch_meta=patch_meta,
             patch_error=patch_error,

@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from .context import ContextPolicy, validate_context_policy
 from .failures import FailureType, _BY_NAME
 from .retry import MAX_RETRY_AFTER, MIN_JITTER, RetryPolicy, validate_policy
 
@@ -36,22 +37,22 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _policy_from_config(path: Path) -> RetryPolicy:
-    """Read only the `retry:` block.
+def _blocks_from_config(path: Path) -> dict:
+    """Read the `retry:` and `context:` blocks.
 
     Deliberately not via Agent.config: Agent imports this package, and an
     inspector reaching back the other way would put a cycle in the graph for
-    the sake of one dictionary.
+    the sake of two dictionaries.
     """
     import yaml
 
     with open(path, "r", encoding="utf-8") as handle:
-        data = yaml.safe_load(handle) or {}
-    return RetryPolicy.from_dict(data.get("retry"))
+        return yaml.safe_load(handle) or {}
 
 
 def _load(args) -> RetryPolicy:
-    policy = _policy_from_config(Path(args.config)) if args.config else RetryPolicy()
+    data = _blocks_from_config(Path(args.config)) if args.config else {}
+    policy = RetryPolicy.from_dict(data.get("retry"))
     if args.max_retries is not None:
         policy.max_retries = args.max_retries
     if args.base_delay is not None:
@@ -123,17 +124,50 @@ def print_taxonomy() -> None:
         print(f"                     {', '.join(sources)}")
 
 
+def print_context(policy: ContextPolicy) -> None:
+    print("\ncontext (Strategy B: tell the agent what it did)")
+    if not policy.enabled:
+        print("  off -- failures still reach the model as tool results, but the")
+        print("  harness never comments and never ends a run for looping.")
+        return
+
+    print(
+        f"  repeat_threshold {policy.repeat_threshold}   "
+        f"failure_threshold {policy.failure_threshold}   "
+        f"max_nudges {policy.max_nudges}   window {policy.window}   "
+        f"schema checks {'on' if policy.validate_tool_calls else 'off'}"
+    )
+    print("\n  identical call, identical result:")
+    for repeat in range(1, policy.repeat_threshold + policy.max_nudges + 1):
+        if repeat < policy.repeat_threshold:
+            verdict = "silent"
+        elif repeat - policy.repeat_threshold < policy.max_nudges:
+            verdict = f"told (#{repeat - policy.repeat_threshold + 1})"
+        else:
+            verdict = "run ends as agent_loop, if the result was a failure"
+        print(f"    call {repeat:<3} {verdict}")
+    print(
+        f"\n  a repeat only counts when the result is identical too, so the\n"
+        f"  edit-test-edit cycle is never flagged; window is {policy.window} calls."
+    )
+
+
 def main(argv: Optional[list] = None) -> int:
     args = build_parser().parse_args(argv)
     policy = _load(args)
+    context = ContextPolicy.from_dict(
+        _blocks_from_config(Path(args.config)).get("context") if args.config else None
+    )
 
-    errors = validate_policy(policy)
+    errors = [f"retry: {error}" for error in validate_policy(policy)]
+    errors += [f"context: {error}" for error in validate_context_policy(context)]
     if errors:
         for error in errors:
-            print(f"retry: {error}", file=sys.stderr)
+            print(error, file=sys.stderr)
         return 2
 
     print_schedule(policy, args.config or "built-in defaults")
+    print_context(context)
     if args.taxonomy:
         print_taxonomy()
     return 0

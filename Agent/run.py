@@ -127,6 +127,10 @@ class TaskRun:
             # grade. A solved task that needed four retries and one that needed
             # none are not the same evidence about the harness.
             "retries": len(run.retries),
+            # And how much it had to be told about its own behaviour. The other
+            # half of the same question: one counts what the environment did to
+            # the run, the other what the harness did to the agent.
+            "interventions": len(run.interventions),
             **lineage,
         }
 

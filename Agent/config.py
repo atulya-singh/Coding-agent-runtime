@@ -14,6 +14,7 @@ from typing import Dict, List, Optional
 
 import yaml
 
+from Recovery.context import ContextPolicy, validate_context_policy
 from Recovery.retry import RetryPolicy, validate_policy
 
 from .pricing import ModelPricing
@@ -56,6 +57,11 @@ class AgentConfig:
     # variable like the rest of this file -- how much retrying a harness does
     # is part of what a reported success rate means.
     retry: RetryPolicy = field(default_factory=RetryPolicy)
+    # What the harness says back to the agent when the agent is the problem --
+    # a malformed tool call, a loop, a command that keeps failing the same way.
+    # Also an experimental variable: plan.md Experiment 3 compares a run that
+    # gets told against one that does not, and `enabled: false` is that control.
+    context: ContextPolicy = field(default_factory=ContextPolicy)
     # Token rates per model, keyed by model id. Not hardcoded in pricing.py: see
     # that module for why. A model missing here reports an unknown cost rather
     # than a zero one.
@@ -75,6 +81,7 @@ class AgentConfig:
             "max_cost_usd": self.max_cost_usd,
             "request_timeout": self.request_timeout,
             "retry": self.retry.to_dict(),
+            "context": self.context.to_dict(),
             "pricing": {name: rates.to_dict() for name, rates in self.pricing.items()},
         }
 
@@ -97,6 +104,7 @@ class AgentConfig:
             ),
             request_timeout=float(data.get("request_timeout", 120.0)),
             retry=RetryPolicy.from_dict(data.get("retry")),
+            context=ContextPolicy.from_dict(data.get("context")),
             pricing={
                 name: ModelPricing.from_dict(rates)
                 for name, rates in (data.get("pricing") or {}).items()
@@ -137,6 +145,7 @@ def validate_config(config: AgentConfig) -> List[str]:
     if config.request_timeout <= 0:
         errors.append(f"request_timeout must be positive, got {config.request_timeout}")
     errors += [f"retry: {error}" for error in validate_policy(config.retry)]
+    errors += [f"context: {error}" for error in validate_context_policy(config.context)]
     return errors
 
 
