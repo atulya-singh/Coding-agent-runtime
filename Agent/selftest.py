@@ -33,7 +33,9 @@ from Tasks.schema import Difficulty, Task, TaskCategory
 from .client import ModelClient, ModelError, ModelResponse
 from .config import DEFAULT_MODEL, AgentConfig, validate_config
 from .loop import (
+    IN_PROGRESS,
     AgentLoop,
+    Snapshot,
     StopReason,
     add_usage,
     format_tool_output,
@@ -42,30 +44,14 @@ from .loop import (
     zero_usage,
 )
 from .pricing import ModelPricing, cost_usd
+from .replay import SCRIPTED_USAGE as USAGE
+from .replay import ScriptedClient, finish_turn, replay_fix, text_turn, tool_turn
 from .run import RunConfig, TaskRun, run_task
 from .tools import FINISH_TOOL_NAME, build_tool_specs
 
 DATASET_DIR = Path(__file__).parent.parent / "Tasks" / "dataset"
 
 # ---- doubles ---------------------------------------------------------------
-
-
-class ScriptedClient:
-    """Replays a fixed list of ModelResponses (or raises a queued exception)."""
-
-    def __init__(self, responses: List, config: Optional[AgentConfig] = None):
-        self.config = config or AgentConfig()
-        self.responses = list(responses)
-        self.seen_messages: List[List[dict]] = []
-
-    def generate(self, messages, tools, system) -> ModelResponse:
-        self.seen_messages.append([dict(message) for message in messages])
-        if not self.responses:
-            raise ModelError("scripted client ran out of responses")
-        item = self.responses.pop(0)
-        if isinstance(item, Exception):
-            raise item
-        return item
 
 
 class FakeToolset:
@@ -111,27 +97,6 @@ class DyingToolset(FakeToolset):
         return ToolResult(tool=tool_name, success=False, error="command timed out")
 
 
-USAGE = {"input_tokens": 100, "output_tokens": 50}
-
-
-def tool_turn(name: str, payload: dict, block_id: str = "tu_1") -> ModelResponse:
-    return ModelResponse(
-        content=[{"type": "tool_use", "id": block_id, "name": name, "input": payload}],
-        stop_reason="tool_use",
-        usage=dict(USAGE),
-    )
-
-
-def finish_turn(summary: str = "done") -> ModelResponse:
-    return tool_turn(FINISH_TOOL_NAME, {"summary": summary}, block_id="tu_finish")
-
-
-def text_turn(text: str = "all set") -> ModelResponse:
-    return ModelResponse(
-        content=[{"type": "text", "text": text}], stop_reason="end_turn", usage=dict(USAGE)
-    )
-
-
 def sample_task() -> Task:
     return Task(
         task_id="selftest-001",
@@ -145,11 +110,13 @@ def sample_task() -> Task:
     )
 
 
-def run_loop(responses, toolset=None, config=None):
+def run_loop(responses, toolset=None, config=None, on_turn=None, resume_from=None):
     config = config or AgentConfig()
     toolset = toolset or FakeToolset()
     client = ScriptedClient(responses, config)
-    loop = AgentLoop(sample_task(), toolset, client, config)
+    loop = AgentLoop(
+        sample_task(), toolset, client, config, on_turn=on_turn, resume_from=resume_from
+    )
     return loop.run(), toolset, client
 
 
@@ -494,6 +461,80 @@ def check_run_infrastructure(c: Checks) -> None:
     c.check("it is still serialisable", isinstance(run.to_dict(), dict))
 
 
+def check_snapshots(c: Checks) -> None:
+    """What the loop offers up for persisting, and when."""
+    seen: List[Snapshot] = []
+    run, _, _ = run_loop(
+        [tool_turn("read_file", {"path": "a.py"}), finish_turn("fixed it")],
+        on_turn=seen.append,
+    )
+    c.equal("a snapshot is taken before the first turn", seen[0].step, 0)
+    c.equal("the first one is not yet an ending", seen[0].status, IN_PROGRESS)
+    c.equal("one per turn boundary, plus the terminal one", [s.step for s in seen], [0, 1, 2])
+    c.equal("the last one carries the stop reason", seen[-1].status, StopReason.FINISHED.value)
+    c.check("the last one is marked terminal", seen[-1].is_terminal)
+    c.check("only the last one is", not any(s.is_terminal for s in seen[:-1]))
+    c.equal("it carries the summary the run ended with", seen[-1].summary, "fixed it")
+    c.equal("the terminal snapshot matches the run", seen[-1].usage, run.usage)
+
+    # A snapshot has to be resumable, and a message list with an unanswered
+    # tool_use is rejected by the API -- so every one must be balanced.
+    for snapshot in seen:
+        requested = [
+            block["id"]
+            for message in snapshot.messages
+            if isinstance(message["content"], list)
+            for block in message["content"]
+            if block.get("type") == "tool_use"
+        ]
+        answered = [
+            block["tool_use_id"]
+            for message in snapshot.messages
+            if isinstance(message["content"], list)
+            for block in message["content"]
+            if block.get("type") == "tool_result"
+        ]
+        if not c.equal(
+            f"the snapshot at step {snapshot.step} answers every tool call it shows",
+            sorted(answered),
+            sorted(requested),
+        ):
+            break
+
+    mid_run: List[Snapshot] = []
+    run, _, _ = run_loop([tool_turn("read_file", {"path": "a.py"})] * 5, config=AgentConfig(max_turns=2), on_turn=mid_run.append)
+    c.equal("a run that is stopped still records why", mid_run[-1].status, StopReason.MAX_TURNS.value)
+
+
+def check_resume(c: Checks) -> None:
+    """Picking a run up again, with no checkpoint format involved."""
+    prior = {
+        "messages": [
+            {"role": "user", "content": "Fix the thing."},
+            {"role": "assistant", "content": [{"type": "text", "text": "looking"}]},
+            {"role": "user", "content": "carry on"},
+        ],
+        "tool_calls": [{"turn": 1, "tool": "read_file", "success": True}],
+        "usage": {"input_tokens": 500, "output_tokens": 100},
+        "turns": 7,
+    }
+    run, _, client = run_loop([finish_turn("done now")], resume_from=prior)
+    c.equal("the earlier conversation is carried in", client.seen_messages[0][:3], prior["messages"])
+    c.equal("turns continue rather than restart", run.turns, 8)
+    c.equal("earlier tool calls are still on the record", len(run.tool_calls), 1)
+    c.equal("tokens already spent still count", run.usage["input_tokens"], 500 + USAGE["input_tokens"])
+
+    # The budget bounds the attempt at the task, not the process making it, so a
+    # resumed run must not be handed a fresh allowance.
+    exhausted = dict(prior, turns=40)
+    run, _, _ = run_loop([finish_turn()], config=AgentConfig(max_turns=40), resume_from=exhausted)
+    c.equal(
+        "a resumed run does not get its turn budget back",
+        run.stop_reason,
+        StopReason.MAX_TURNS,
+    )
+
+
 def run_offline(c: Checks) -> None:
     check_tool_specs(c)
     check_finish_path(c)
@@ -517,30 +558,11 @@ def run_offline(c: Checks) -> None:
     check_stop_reason_attribution(c)
     check_agent_record(c)
     check_run_infrastructure(c)
+    check_snapshots(c)
+    check_resume(c)
 
 
 # ---- live: the same loop, a real container, a scripted agent ---------------
-
-
-def scripted_fix(task, repo) -> List[ModelResponse]:
-    """Turn the task's known-good upstream fix into agent-shaped tool calls.
-
-    The point is to exercise the wiring, not the model, so the "agent" here is
-    deterministic: look at the file, write the version upstream shipped, run the
-    public tests, call finish. If this run does not end SOLVED, the fault is in
-    the harness -- the patch is by construction the right one.
-    """
-    responses = [tool_turn("read_file", {"path": task.reference_paths[0]}, "tu_read")]
-    for index, rel_path in enumerate(task.reference_paths):
-        content = file_at_commit(repo, task.reference_commit, rel_path).decode("utf-8")
-        responses.append(
-            tool_turn("write_file", {"path": rel_path, "content": content}, f"tu_write_{index}")
-        )
-    responses.append(
-        tool_turn("run_tests", {"command": task.public_tests}, "tu_tests")
-    )
-    responses.append(finish_turn("applied the upstream fix"))
-    return responses
 
 
 def run_end_to_end(c: Checks, task_ids, dataset_dir: Path, repo_cache: Path) -> None:
@@ -557,7 +579,7 @@ def run_end_to_end(c: Checks, task_ids, dataset_dir: Path, repo_cache: Path) -> 
         repo = ensure_repo(
             task.repository, repo_cache, [task.commit, task.reference_commit], quiet=True
         )
-        client = ScriptedClient(scripted_fix(task, repo))
+        client = ScriptedClient(replay_fix(task, repo))
         run = run_task(
             task,
             task_dir,

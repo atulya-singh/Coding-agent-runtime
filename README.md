@@ -7,6 +7,7 @@ Building out this project in different stages:
 3. Task dataset : Tasks mined from real upstream commits across all seven categories, each verified in a sandbox to be unsolved before the fix and solved after it.
 4. Objective evaluation : Grade an agent by replaying its patch onto a clean checkout and running build, tests, benchmarks, mutations and static checks -- never by asking a model whether the answer looks right.
 5. Agent loop : Drive a real model through the sandboxed tools -- generate, execute, feed the result back -- until it reports done or hits a turn, token or cost budget.
+6. State and checkpointing : Write every turn to disk -- the conversation and the diff so far -- so a run killed partway can be rebuilt in a fresh container and finished, and graded the same way an uninterrupted one is.
 
 ## Running tools in the sandbox
 
@@ -112,7 +113,14 @@ From the command line:
 ```
 python -m Agent requests-001-netrc-empty-default --grade
 python -m Agent requests-001-netrc-empty-default --dry-run   # spends nothing
+python -m Agent requests-001-netrc-empty-default --replay    # the oracle agent
 ```
+
+`--replay` drives the loop with an agent that already knows the answer: it
+replays the task's own upstream fix through the same sandboxed tools. It costs
+nothing, and it is the control every capability number here is read against --
+a success rate means little without evidence the ceiling is reachable under the
+same budgets, tools and grading.
 
 Defaults -- model, thinking, effort, budgets, token rates -- come from
 `Agent/config.yaml`, so what a run was configured with is a file you can read
@@ -159,6 +167,80 @@ Without `--offline` it then runs the whole thing for real -- container, setup,
 toolhost, tool calls, diff, grade -- with a scripted agent replaying a task's
 known upstream fix. That still needs no API key: if it does not grade as solved,
 the wiring is wrong, because the patch is correct by construction.
+
+## Surviving a crash
+
+The sandbox is deliberately disposable (Principle 2) -- there is no `docker
+commit`, no pause, no volume anywhere in `Sandbox/`, and adding one to rescue a
+dying run would weaken the isolation the whole project rests on. So `State`
+checkpoints the only two things a run actually consists of:
+
+```
+the conversation   the exact message list, verbatim and replayable
+the work so far    the accumulated diff against the base commit
+```
+
+Given those, resuming is not recovery but reconstruction: a **new** container
+from the base commit, the recorded diff applied on top, setup re-run, the
+conversation rehydrated, the loop continued. Nothing is salvaged from the dead
+container, so nothing depends on it having survived.
+
+```
+python -m Agent <task_id>            # every turn is checkpointed
+python -m Agent <task_id> --resume   # finish it from the last checkpoint
+python -m State <task_id>            # what is on disk, and is it resumable
+```
+
+```
+<state_root>/<task_id>/checkpoints/000003-b78510be.json    the record
+                                   000003-b78510be.patch   the diff, beside it
+                      /latest.json
+```
+
+Plain files, and the write order inside a save is load-bearing: patch, then
+record, then `latest.json`. A crash at any instant leaves `latest` naming a
+checkpoint that is whole, because it is only written once everything it names
+has landed. Each file goes to a `.tmp` and is renamed, so no reader ever sees a
+half-written one.
+
+Three decisions worth knowing:
+
+- **Checkpoints are taken at turn boundaries, not per tool call.** Between them
+  a `tool_use` block may not yet have its `tool_result`, and the API rejects a
+  message list in that state -- a half-turn is not something anything could
+  resume from, however faithfully it were written down.
+- **A checkpoint that never captured the work refuses to be resumed.** If the
+  container died before the diff could be taken, the conversation is intact but
+  the edits are gone; resuming would look fine and silently discard them.
+- **Budgets are cumulative across a resume.** `max_turns` and the cost ceiling
+  bound the attempt at the task, not the process making it, so a recovered run
+  gets the remainder of the original allowance rather than a fresh one.
+
+Then the experiment this was built for -- kill a run and see whether it can
+still finish:
+
+```
+python -m Agent.experiment <task_id> --state-root /tmp/sweep --replay
+```
+
+Each trial launches a real run as a child process and `SIGKILL`s the whole
+process group at 10/25/50/75/90% of `max_turns` -- no cleanup, no final write,
+nothing the loop could have done to prepare. The orphaned container is force-
+removed, the run is finished from disk, and the result goes through exactly the
+Phase 4 grader an uninterrupted run would, tagged `killed_at_fraction` and
+`resumed_from` so a recovered grade is never mistaken for an ordinary one.
+
+```
+python -m State.selftest --offline
+python -m State.selftest
+```
+
+The live half is the claim itself, and it is deliberately harsh: a task is run
+partway in a real container, then **everything in memory is thrown away** -- the
+sandbox, the loop, the client, the store object. All that is left is a
+directory. A new store reads it, a new container is built, the run finishes, and
+it grades `SOLVED`. That is the work surviving a boundary nothing in memory
+crossed.
 
 ## Objective evaluation
 

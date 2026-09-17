@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from Execution.sandbox_tools import SandboxToolset
 from Execution.tools.base import ToolResult
@@ -35,6 +35,11 @@ from .tools import FINISH_TOOL_NAME, build_tool_specs
 #: command output, but a read_file or search_code can still be arbitrarily
 #: large, and one of those can otherwise consume a whole context window.
 MAX_TOOL_OUTPUT_CHARS = 20_000
+
+#: The status of a snapshot taken while the run is still going. Every other
+#: status is a StopReason value, so one field answers both "is this run over"
+#: and "why did it end".
+IN_PROGRESS = "in_progress"
 
 
 class StopReason(str, Enum):
@@ -130,6 +135,36 @@ class AgentRun:
         }
 
 
+@dataclass
+class Snapshot:
+    """The loop's state at a turn boundary, for whoever wants to persist it.
+
+    A turn boundary is the only point a run can be resumed from. Between them a
+    tool_use block may not yet have its tool_result, and the API rejects a
+    message list in that state outright -- so a half-turn is not a state anything
+    could continue from, however faithfully it were written to disk.
+
+    Deliberately not a checkpoint: no ids, no parents, no diff, nothing about
+    where it might be stored. The loop hands this out and stays ignorant of what
+    happens next, the same way it stays ignorant of the container.
+    """
+
+    task_id: str
+    model: str
+    step: int
+    status: str
+    messages: List[dict] = field(default_factory=list)
+    tool_calls: List[dict] = field(default_factory=list)
+    usage: dict = field(default_factory=zero_usage)
+    cost_usd: Optional[float] = None
+    summary: str = ""
+    error: str = ""
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status != IN_PROGRESS
+
+
 def truncate(text: str, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
     """Keep the head and the tail. A test run's verdict is in its last lines and
     a file's signature is in its first, so dropping either end loses the part
@@ -176,6 +211,8 @@ class AgentLoop:
         toolset: SandboxToolset,
         client: ModelClient,
         config: Optional[AgentConfig] = None,
+        on_turn: Optional[Callable[[Snapshot], None]] = None,
+        resume_from: Optional[dict] = None,
     ):
         self.task = task
         self.toolset = toolset
@@ -183,14 +220,44 @@ class AgentLoop:
         self.config = config or client.config
         self.system = build_system_prompt(task)
         self.tool_specs = build_tool_specs(toolset)
+        #: Called at every turn boundary and once at the end. A plain callable
+        #: rather than a checkpoint store, so persistence stays out of here.
+        self.on_turn = on_turn
+        #: `{messages, tool_calls, usage, turns}` from an earlier run of the same
+        #: task. A plain dict on purpose: this module must not learn about the
+        #: on-disk checkpoint format, nor that one exists.
+        self.resume_from = resume_from
 
     def run(self) -> AgentRun:
-        messages = build_initial_messages(self.task)
-        usage = zero_usage()
-        tool_calls: List[dict] = []
-        turns = 0
+        prior = self.resume_from or {}
+        messages = list(prior.get("messages") or []) or build_initial_messages(self.task)
+        usage = add_usage(zero_usage(), prior.get("usage") or {})
+        tool_calls = list(prior.get("tool_calls") or [])
+        # Carried across the resume: max_turns and the budgets bound the attempt
+        # at the task, not the process that happens to be making it. Resetting
+        # them would hand a resumed run a second full allowance.
+        turns = int(prior.get("turns") or 0)
+
+        def record(status: str, summary: str = "", error: str = "") -> None:
+            if self.on_turn is None:
+                return
+            self.on_turn(
+                Snapshot(
+                    task_id=self.task.task_id,
+                    model=self.config.model,
+                    step=turns,
+                    status=status,
+                    messages=messages,
+                    tool_calls=tool_calls,
+                    usage=usage,
+                    cost_usd=cost_usd(usage, self.config.pricing_for_model()),
+                    summary=summary,
+                    error=error,
+                )
+            )
 
         def finish(reason: StopReason, summary: str = "", error: str = "") -> AgentRun:
+            record(reason.value, summary, error)
             return AgentRun(
                 task_id=self.task.task_id,
                 model=self.config.model,
@@ -203,6 +270,11 @@ class AgentLoop:
                 summary=summary,
                 error=error,
             )
+
+        # Before the first call to the model: a run killed in its opening
+        # seconds still leaves something to resume from, and `latest` exists for
+        # anything watching from the moment the run starts.
+        record(IN_PROGRESS)
 
         while True:
             if turns >= self.config.max_turns:
@@ -271,6 +343,10 @@ class AgentLoop:
 
             if summary is not None:
                 return finish(StopReason.FINISHED, summary=summary)
+
+            # Every tool_use is answered and the container is alive: the first
+            # point since the last one where this run could be picked up again.
+            record(IN_PROGRESS)
 
     def _sandbox_gone(self) -> bool:
         """True once the toolset has no live container behind it.

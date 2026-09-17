@@ -21,6 +21,12 @@ The order matters, and each step is a different kind of failure:
 The model client is built here, on the host, and is never passed to the Sandbox
 or the toolset. That is what keeps the Phase 1 rule -- no credentials in the
 container -- a property of the wiring rather than a habit.
+
+Resuming a killed run is the same function with two additions: the checkpoint's
+accumulated diff is applied to the base export before the container starts, and
+the loop is handed the conversation it had reached. Deliberately not a separate
+`resume()` -- one code path means a recovered run cannot drift from a fresh one,
+which is the only thing that makes their grades comparable.
 """
 from __future__ import annotations
 
@@ -33,10 +39,13 @@ from pathlib import Path
 from typing import Any, Optional
 
 from Evaluation.evaluator import EvaluationConfig, Evaluator
-from Evaluation.patch import Patch, collect_patch
+from Evaluation.patch import Patch, apply_patch, collect_patch
 from Evaluation.result import EvaluationResult
 from Execution.sandbox_tools import SandboxToolset
 from Sandbox import Sandbox
+from State.checkpoint import Checkpoint
+from State.recorder import CheckpointRecorder
+from State.store import CheckpointStore
 from Tasks.harness import DEFAULT_REPO_CACHE, ensure_repo, export_commit, tail
 from Tasks.schema import Task
 
@@ -63,6 +72,9 @@ class RunConfig:
     #: Grade the resulting patch through the Phase 4 pipeline (a second container).
     grade: bool = False
     quiet: bool = False
+    #: Distinguishes this attempt's container from another at the same task --
+    #: a resumed run must not collide with the orphan the killed one left behind.
+    sandbox_suffix: str = ""
 
 
 @dataclass
@@ -78,6 +90,11 @@ class TaskRun:
     #: these belong outside the capability rates, not inside them as zeroes.
     infrastructure_error: str = ""
     duration_ms: float = 0.0
+    #: The last checkpoint this attempt wrote, and the one it started from.
+    #: Together they are the claim "this grade came from a recovered run", and
+    #: they are on the record so that claim can be checked rather than trusted.
+    checkpoint_id: str = ""
+    resumed_from: str = ""
 
     @property
     def ok(self) -> bool:
@@ -91,9 +108,10 @@ class TaskRun:
         since Phase 4, waiting for exactly this: who attempted the task, under
         what budget, and what it cost.
         """
+        lineage = {"checkpoint_id": self.checkpoint_id, "resumed_from": self.resumed_from}
         run = self.agent
         if run is None:
-            return {"model": self.model, "provider": PROVIDER}
+            return {"model": self.model, "provider": PROVIDER, **lineage}
         return {
             "model": run.model,
             "provider": PROVIDER,
@@ -105,6 +123,7 @@ class TaskRun:
             "total_tokens": run.total_tokens,
             "cost_usd": run.cost_usd,
             "summary": run.summary,
+            **lineage,
         }
 
     def to_dict(self) -> dict:
@@ -113,6 +132,8 @@ class TaskRun:
             "model": self.model,
             "duration_ms": round(self.duration_ms, 2),
             "infrastructure_error": self.infrastructure_error,
+            "checkpoint_id": self.checkpoint_id,
+            "resumed_from": self.resumed_from,
             "agent": self.agent.to_dict() if self.agent else None,
             "patch": self.patch.to_dict() if self.patch else None,
             "evaluation": self.evaluation.to_dict() if self.evaluation else None,
@@ -126,12 +147,23 @@ def run_task(
     agent_config: Optional[AgentConfig] = None,
     repo: Optional[Path] = None,
     config: Optional[RunConfig] = None,
+    store: Optional[CheckpointStore] = None,
+    resume_from: Optional[Checkpoint] = None,
 ) -> TaskRun:
     """Attempt one task and return what happened. Never raises for a failed
-    attempt -- a failure is a result, and the record says whose it was."""
+    attempt -- a failure is a result, and the record says whose it was.
+
+    Pass `store` to checkpoint every turn, and `resume_from` to continue a run
+    that was interrupted. Resuming needs a store too: a recovered run that could
+    not itself be recovered would be a strange thing to measure.
+    """
     config = config or RunConfig()
     agent_config = agent_config or getattr(client, "config", None) or AgentConfig()
-    run = TaskRun(task_id=task.task_id, model=agent_config.model)
+    run = TaskRun(
+        task_id=task.task_id,
+        model=agent_config.model,
+        resumed_from=resume_from.checkpoint_id if resume_from else "",
+    )
     started = time.monotonic()
 
     workspace = Path(tempfile.mkdtemp(prefix=f"agent-{task.task_id}-"))
@@ -139,18 +171,38 @@ def run_task(
     repo_path: Optional[Path] = Path(repo) if repo else None
 
     try:
+        if resume_from is not None:
+            refusal = resume_from.resumable
+            if refusal:
+                raise ValueError(f"checkpoint {resume_from.checkpoint_id} cannot be resumed: {refusal}")
+
         if repo_path is None:
             repo_path = ensure_repo(
                 task.repository, config.repo_cache, [task.commit], quiet=config.quiet
             )
         export_commit(repo_path, task.commit, base)
 
+        # What every diff is taken against. On a resumed run the container starts
+        # from work already done, but the patch that gets graded still has to be
+        # the whole change since the base commit -- so the tree the container is
+        # seeded from and the tree it is compared to stop being the same thing,
+        # and a second pristine export is what keeps the comparison honest.
+        diff_base = base
+        if resume_from is not None and resume_from.patch_text:
+            diff_base = workspace / "pristine"
+            export_commit(repo_path, task.commit, diff_base)
+            # Replayed onto the export before the container sees it, so a
+            # recovered environment is built the way a graded one is: base commit
+            # plus a diff, never a filesystem rescued from a dead container.
+            apply_patch(Patch.from_text(resume_from.patch_text), base)
+
         # Host-side, before the container exists, and deliberately not reachable
         # from it: this object holds the API key.
         client = client or ModelClient(agent_config)
 
         sandbox_config = task.resource_limit.to_sandbox_config()
-        with Sandbox(task_id=f"agent-{task.task_id}", config=sandbox_config) as sandbox:
+        sandbox_id = f"agent-{task.task_id}{config.sandbox_suffix}"
+        with Sandbox(task_id=sandbox_id, config=sandbox_config) as sandbox:
             sandbox.initialize(str(base))
 
             setup_error = _run_setup(sandbox, task, config)
@@ -159,8 +211,22 @@ def run_task(
             else:
                 toolset = SandboxToolset(sandbox)
                 toolset.install()
-                run.agent = AgentLoop(task, toolset, client, agent_config).run()
-                run.patch = _collect(sandbox, base, task, config)
+                recorder = (
+                    _recorder(store, sandbox, diff_base, task, agent_config, resume_from)
+                    if store is not None
+                    else None
+                )
+                run.agent = AgentLoop(
+                    task,
+                    toolset,
+                    client,
+                    agent_config,
+                    on_turn=recorder,
+                    resume_from=resume_from.resume_state() if resume_from else None,
+                ).run()
+                if recorder is not None:
+                    run.checkpoint_id = recorder.last_checkpoint_id
+                run.patch = _collect(sandbox, diff_base, task, config)
                 if run.patch is None:
                     run.infrastructure_error = (
                         "the container was torn down before the diff could be collected "
@@ -177,6 +243,29 @@ def run_task(
 
     run.duration_ms = (time.monotonic() - started) * 1000
     return run
+
+
+def _recorder(
+    store: CheckpointStore,
+    sandbox: Sandbox,
+    diff_base: Path,
+    task: Task,
+    agent_config: AgentConfig,
+    resume_from: Optional[Checkpoint],
+) -> CheckpointRecorder:
+    return CheckpointRecorder(
+        store=store,
+        sandbox=sandbox,
+        base_dir=diff_base,
+        agent_config=agent_config.to_dict(),
+        provenance={
+            "repository": task.repository,
+            "commit": task.commit,
+            "image": task.resource_limit.to_sandbox_config().image,
+        },
+        provider=PROVIDER,
+        parent_checkpoint_id=resume_from.checkpoint_id if resume_from else "",
+    )
 
 
 def _run_setup(sandbox: Sandbox, task: Task, config: RunConfig) -> str:

@@ -8,9 +8,10 @@ from .config import (
     save_config,
     validate_config,
 )
-from .loop import AgentLoop, AgentRun, StopReason
+from .loop import IN_PROGRESS, AgentLoop, AgentRun, Snapshot, StopReason
 from .pricing import ModelPricing, cost_usd
 from .prompts import build_initial_messages, build_system_prompt
+from .replay import ScriptedClient, replay_fix
 from .run import RunConfig, TaskRun, run_task
 from .tools import FINISH_TOOL_NAME, FINISH_TOOL_SPEC, build_tool_specs
 
@@ -23,7 +24,11 @@ __all__ = [
     "save_config",
     "AgentLoop",
     "AgentRun",
+    "Snapshot",
     "StopReason",
+    "IN_PROGRESS",
+    "ScriptedClient",
+    "replay_fix",
     "run_task",
     "RunConfig",
     "TaskRun",

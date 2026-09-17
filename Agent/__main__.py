@@ -3,10 +3,16 @@
     python -m Agent requests-001-netrc-empty-default --grade
     python -m Agent --all --grade --json runs.json
     python -m Agent requests-001-netrc-empty-default --dry-run   # spends nothing
+    python -m Agent requests-001-netrc-empty-default --resume    # finish a killed run
+    python -m Agent requests-001-netrc-empty-default --replay    # the oracle agent
 
 Defaults come from Agent/config.yaml, so the model and the budgets are edited in
 one hand-written file rather than passed on the command line every time; --model
 and --max-turns override it for a one-off.
+
+Every turn is checkpointed to --state-root, so a run killed at any point can be
+finished later with --resume. That costs a tree copy per turn, which is nothing
+beside the model call it sits next to; --no-checkpoints turns it off anyway.
 
 This is the only entry point that spends money, so it says what it is about to
 do before it does it, and --dry-run stops right there.
@@ -20,11 +26,13 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
+from State.store import DEFAULT_STATE_ROOT, CheckpointStore
 from Tasks.harness import DEFAULT_REPO_CACHE, ensure_repo
 from Tasks.loader import discover_task_dirs, load_task
 
 from .client import API_KEY_NAME, ModelClient, ModelError
 from .config import AgentConfig, load_config, validate_config
+from .replay import ScriptedClient, replay_fix
 from .run import RunConfig, TaskRun, run_task
 
 DATASET_DIR = Path(__file__).parent.parent / "Tasks" / "dataset"
@@ -46,6 +54,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--artifacts", metavar="DIR", help="keep each tree and run log here")
     parser.add_argument("--patch-out", metavar="FILE", help="write the diff here (one task only)")
     parser.add_argument("--json", metavar="FILE", help="write the full run records here")
+    parser.add_argument("--state-root", default=str(DEFAULT_STATE_ROOT), help="where checkpoints go")
+    parser.add_argument(
+        "--no-checkpoints", action="store_true", help="do not checkpoint each turn"
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="continue each task from its latest checkpoint instead of starting over",
+    )
+    parser.add_argument(
+        "--replay",
+        action="store_true",
+        help="use the oracle agent (replays the known fix) instead of a model -- spends nothing",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -95,6 +117,10 @@ def _describe(run: TaskRun) -> str:
             f"  patch     {len(run.patch.files)} file(s), "
             f"+{run.patch.lines_added}/-{run.patch.lines_deleted}, {run.patch.sha256[:12]}"
         )
+    if run.resumed_from:
+        lines.append(f"  resumed   from checkpoint {run.resumed_from}")
+    if run.checkpoint_id:
+        lines.append(f"  saved     latest checkpoint {run.checkpoint_id}")
     if run.evaluation is not None:
         lines.append(f"  -> {run.evaluation.outcome.value.upper()}")
     return "\n".join(lines)
@@ -133,10 +159,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("--patch-out writes one diff; name exactly one task_id", file=sys.stderr)
         return 2
 
+    store = None if args.no_checkpoints else CheckpointStore(Path(args.state_root))
+    agent_name = "the oracle agent (replay)" if args.replay else agent_config.model
     print(
-        f"model {agent_config.model}  max_turns {agent_config.max_turns}  "
+        f"model {agent_name}  max_turns {agent_config.max_turns}  "
         f"max_tokens {agent_config.max_tokens}  "
-        f"budget {_money(agent_config.max_cost_usd) if agent_config.max_cost_usd else 'none'}"
+        f"budget {_money(agent_config.max_cost_usd) if agent_config.max_cost_usd else 'none'}  "
+        f"checkpoints {args.state_root if store else 'off'}"
     )
     for task, _ in tasks:
         print(f"  would run {task.task_id} [{task.category.value}] in {task.resource_limit.to_sandbox_config().image}")
@@ -144,20 +173,26 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("\ndry run: nothing was started")
         return 0
 
-    # Before any container: a bad key or a mistyped model id should cost
-    # seconds, not the minutes it takes to build an environment first.
-    client = ModelClient(agent_config)
-    try:
-        client.preflight()
-    except ModelError as exc:
-        print(f"\ncannot reach the model: {exc}", file=sys.stderr)
-        print(
-            f"set {API_KEY_NAME} in this shell, or run `ant auth login`; "
-            "the key is used host-side only and never enters the container",
-            file=sys.stderr,
-        )
+    if args.resume and store is None:
+        print("--resume needs checkpoints; drop --no-checkpoints", file=sys.stderr)
         return 2
-    print("credentials and model id check out")
+
+    client = None
+    if not args.replay:
+        # Before any container: a bad key or a mistyped model id should cost
+        # seconds, not the minutes it takes to build an environment first.
+        client = ModelClient(agent_config)
+        try:
+            client.preflight()
+        except ModelError as exc:
+            print(f"\ncannot reach the model: {exc}", file=sys.stderr)
+            print(
+                f"set {API_KEY_NAME} in this shell, or run `ant auth login`; "
+                "the key is used host-side only and never enters the container",
+                file=sys.stderr,
+            )
+            return 2
+        print("credentials and model id check out")
 
     config = RunConfig(
         repo_cache=Path(args.repo_cache),
@@ -171,21 +206,42 @@ def main(argv: Optional[List[str]] = None) -> int:
     for task, task_dir in tasks:
         if task.repository not in repos:
             commits = [t.commit for t, _ in tasks if t.repository == task.repository]
+            if args.replay:
+                commits += [t.reference_commit for t, _ in tasks if t.repository == task.repository]
             repos[task.repository] = ensure_repo(
                 task.repository, Path(args.repo_cache), commits, quiet=args.quiet
             )
+        repo = repos[task.repository]
+
+        resume_from = None
+        if args.resume:
+            resume_from = store.latest(task.task_id)
+            if resume_from is None:
+                print(f"\n=== {task.task_id}: nothing checkpointed to resume from", file=sys.stderr)
+                continue
+            # Asking to resume something that is already over is a mistake at the
+            # keyboard, not a broken harness, and must not be counted as one.
+            refusal = resume_from.resumable
+            if refusal:
+                print(f"\n=== {task.task_id}: {refusal}", file=sys.stderr)
+                continue
 
         print(f"\n=== {task.task_id}  [{task.category.value}]")
         run = run_task(
             task,
             task_dir,
-            client=client,
+            client=ScriptedClient(replay_fix(task, repo), agent_config) if args.replay else client,
             agent_config=agent_config,
-            repo=repos[task.repository],
+            repo=repo,
             config=config,
+            store=store,
+            resume_from=resume_from,
         )
         runs.append(run)
         print(_describe(run))
+
+    if not runs:
+        return 2
 
     if args.patch_out and runs[0].patch is not None:
         Path(args.patch_out).write_text(runs[0].patch.text, encoding="utf-8")
