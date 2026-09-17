@@ -14,6 +14,8 @@ from typing import Dict, List, Optional
 
 import yaml
 
+from Recovery.retry import RetryPolicy, validate_policy
+
 from .pricing import ModelPricing
 
 DEFAULT_MODEL = "claude-opus-5"
@@ -49,6 +51,11 @@ class AgentConfig:
     max_cost_usd: Optional[float] = None
     # Per-request timeout, in seconds.
     request_timeout: float = 120.0
+    # What happens when a request times out, drops, or comes back 429. Held
+    # here rather than inside ModelClient because it is an experimental
+    # variable like the rest of this file -- how much retrying a harness does
+    # is part of what a reported success rate means.
+    retry: RetryPolicy = field(default_factory=RetryPolicy)
     # Token rates per model, keyed by model id. Not hardcoded in pricing.py: see
     # that module for why. A model missing here reports an unknown cost rather
     # than a zero one.
@@ -67,6 +74,7 @@ class AgentConfig:
             "max_total_tokens": self.max_total_tokens,
             "max_cost_usd": self.max_cost_usd,
             "request_timeout": self.request_timeout,
+            "retry": self.retry.to_dict(),
             "pricing": {name: rates.to_dict() for name, rates in self.pricing.items()},
         }
 
@@ -88,6 +96,7 @@ class AgentConfig:
                 float(data["max_cost_usd"]) if data.get("max_cost_usd") is not None else None
             ),
             request_timeout=float(data.get("request_timeout", 120.0)),
+            retry=RetryPolicy.from_dict(data.get("retry")),
             pricing={
                 name: ModelPricing.from_dict(rates)
                 for name, rates in (data.get("pricing") or {}).items()
@@ -127,6 +136,7 @@ def validate_config(config: AgentConfig) -> List[str]:
             )
     if config.request_timeout <= 0:
         errors.append(f"request_timeout must be positive, got {config.request_timeout}")
+    errors += [f"retry: {error}" for error in validate_policy(config.retry)]
     return errors
 
 

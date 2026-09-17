@@ -36,6 +36,27 @@ max_cost_usd: null
 # Per-request timeout, in seconds.
 request_timeout: 120.0
 
+# What the harness does when a model call times out, drops, or is rate-limited
+# (Recovery Strategy A). Five retries means six attempts; the waits between
+# them grow 1s, 2s, 4s, 8s, 16s -- about 31 seconds of patience per call, which
+# covers a restart or a rate-limit window without parking a run indefinitely.
+#
+# This is an experimental variable, not a constant: how hard a harness retries
+# changes what its reported success rate means, so it is recorded with the run.
+# Run `python -m Recovery --config Agent/config.yaml` to see the exact schedule
+# these numbers produce.
+#
+# jitter multiplies each wait by a random 0.5-1.0 so parallel workers do not
+# all come back at the same instant. A server-sent Retry-After wins over the
+# computed wait when respect_retry_after is on.
+retry:
+  max_retries: 5
+  base_delay: 1.0
+  multiplier: 2.0
+  max_delay: 30.0
+  jitter: true
+  respect_retry_after: true
+
 # Token rates in dollars per million tokens. Rates are configuration, not code:
 # a stale number here would silently corrupt every cost figure the project
 # reports, and a model with no entry reports an unknown cost rather than a free

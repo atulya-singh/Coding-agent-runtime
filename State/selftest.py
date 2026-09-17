@@ -75,6 +75,17 @@ def sample_checkpoint(**overrides) -> Checkpoint:
         tool_calls=[{"turn": 1, "tool": "read_file", "success": True}],
         usage={"input_tokens": 120, "output_tokens": 40},
         cost_usd=0.0012,
+        retries=[
+            {
+                "operation": "messages.create",
+                "retry": 1,
+                "failure": "rate_limit",
+                "error": "429",
+                "delay_s": 1.0,
+                "from_retry_after": False,
+                "at": "2026-09-17T00:00:00+00:00",
+            }
+        ],
         patch_text="diff --git a/x.py b/x.py\n",
         patch_sha256="deadbeef",
         patch_meta={"files": ["x.py"]},
@@ -155,11 +166,14 @@ def check_no_drift_from_the_loop(c: Checks) -> None:
 def check_resume_state(c: Checks) -> None:
     state = sample_checkpoint().resume_state()
     c.equal(
-        "the loop is handed exactly the four keys it reads",
+        "the loop is handed exactly the five keys it reads",
         sorted(state),
-        ["messages", "tool_calls", "turns", "usage"],
+        ["messages", "retries", "tool_calls", "turns", "usage"],
     )
     c.equal("the step becomes the turn count", state["turns"], 3)
+    # Otherwise a recovered run restarts its retry count at zero and the record
+    # understates how badly the environment was behaving.
+    c.equal("retries absorbed before the crash are handed back", len(state["retries"]), 1)
 
 
 def check_store(c: Checks) -> None:
@@ -291,8 +305,15 @@ def check_recorder(c: Checks) -> None:
         c.equal("the first checkpoint has no parent", empty.parent_checkpoint_id, "")
 
         (work / "app.py").write_text("value = 2\n", encoding="utf-8")
-        changed = recorder(snapshot(1))
+        retried = [{"operation": "messages.create", "retry": 1, "failure": "model_timeout"}]
+        changed = recorder(snapshot(1, retries=retried))
         c.check("the agent's edit shows up in the diff", "value = 2" in changed.patch_text)
+        c.equal("retries carry from the snapshot onto the checkpoint", changed.retries, retried)
+        c.equal(
+            "and survive the trip through disk",
+            store.latest("selftest-001").retries,
+            retried,
+        )
         c.equal("it records which files changed", changed.patch_meta["files"], ["app.py"])
         c.equal("each checkpoint points at the last", changed.parent_checkpoint_id, empty.checkpoint_id)
         c.equal("the config it ran under is kept", changed.agent_config, {"model": "m"})

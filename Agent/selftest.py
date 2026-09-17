@@ -25,6 +25,7 @@ from typing import List, Optional
 from Evaluation.result import Outcome
 from Evaluation.selftest import Checks
 from Execution.tools.base import ToolResult
+from Recovery.retry import RetryAttempt, RetryLog
 from Tasks.harness import DEFAULT_REPO_CACHE, ensure_repo, file_at_commit
 from Tasks.loader import discover_task_dirs, load_task
 from Sandbox.secrets import SecretBroker
@@ -535,6 +536,64 @@ def check_resume(c: Checks) -> None:
     )
 
 
+def check_retries_on_the_record(c: Checks) -> None:
+    """A retry the client absorbed still has to reach the run record.
+
+    The loop never sees one -- Recovery swallows it inside ModelClient, which
+    is the point: a rate limit should not end a forty-turn run. But a harness
+    that hides its own interruptions makes every environment look healthy, so
+    the one thing that must not be silent is the record.
+    """
+
+    class RetryingClient(ScriptedClient):
+        """A scripted client that also claims to have retried."""
+
+        def __init__(self, responses, config, retries):
+            super().__init__(responses, config)
+            self.retry_log = RetryLog(retries)
+
+    timeout = RetryAttempt("messages.create", 1, "model_timeout", "slow", 1.0)
+    limited = RetryAttempt("messages.create", 2, "rate_limit", "429", 2.0)
+    config = AgentConfig()
+
+    seen: List[Snapshot] = []
+    client = RetryingClient([finish_turn("done")], config, [timeout, limited])
+    run = AgentLoop(sample_task(), FakeToolset(), client, config, on_turn=seen.append).run()
+    c.equal("the client's retries reach the run record", len(run.retries), 2)
+    c.equal(
+        "each named by what went wrong",
+        [entry["failure"] for entry in run.retries],
+        ["model_timeout", "rate_limit"],
+    )
+    c.equal("every snapshot carries them too", [len(s.retries) for s in seen], [2, 2])
+    c.equal("they survive serialisation", len(run.to_dict()["retries"]), 2)
+    c.equal(
+        "and the grader is told how many there were",
+        TaskRun(task_id="t", agent=run).agent_record()["retries"],
+        2,
+    )
+
+    clean, _, _ = run_loop([finish_turn()])
+    c.equal("a client that never retried reports none, not nothing", clean.retries, [])
+    c.equal("and the grader sees a zero", TaskRun(task_id="t", agent=clean).agent_record()["retries"], 0)
+
+    prior = {
+        "messages": [{"role": "user", "content": "Fix the thing."}],
+        "turns": 3,
+        "retries": [timeout.to_dict()],
+    }
+    client = RetryingClient([finish_turn()], config, [limited])
+    resumed = AgentLoop(
+        sample_task(), FakeToolset(), client, config, resume_from=prior
+    ).run()
+    c.equal("a resumed run keeps the retries from before the crash", len(resumed.retries), 2)
+    c.equal(
+        "oldest first, so the record reads in run order",
+        [entry["failure"] for entry in resumed.retries],
+        ["model_timeout", "rate_limit"],
+    )
+
+
 def run_offline(c: Checks) -> None:
     check_tool_specs(c)
     check_finish_path(c)
@@ -560,6 +619,7 @@ def run_offline(c: Checks) -> None:
     check_run_infrastructure(c)
     check_snapshots(c)
     check_resume(c)
+    check_retries_on_the_record(c)
 
 
 # ---- live: the same loop, a real container, a scripted agent ---------------

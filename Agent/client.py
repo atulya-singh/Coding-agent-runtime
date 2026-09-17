@@ -10,12 +10,20 @@ Responses are normalised to plain dicts here, at the one boundary where SDK
 objects enter the system. Everything downstream -- the message list, the tool
 history, and later the checkpoint on disk -- is then JSON-serialisable by
 construction rather than by a conversion step someone has to remember.
+
+This is also where Recovery's retry policy is applied. A timeout, a dropped
+connection or a 429 is not a fact about the agent's ability to solve the task,
+and letting one end a forty-turn run twenty turns in would put an environmental
+hiccup in the middle of a capability measurement. Retries are absorbed here and
+written down on `retry_log`, so the run continues and the interruption is still
+on the record.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
+from Recovery.retry import RetryLog, RetryPolicy, retry_call
 from Sandbox.secrets import SecretBroker
 
 from .config import AgentConfig
@@ -99,8 +107,14 @@ class ModelClient:
         api_key: Optional[str] = None,
         client: Any = None,
         broker: Optional[SecretBroker] = None,
+        retry_policy: Optional[RetryPolicy] = None,
     ):
         self.config = config or AgentConfig()
+        self.retry_policy = retry_policy or self.config.retry
+        #: Every retry this client made, in order. Read by AgentLoop onto the
+        #: run record; a client that never retried carries an empty log rather
+        #: than no log, so "we did not retry" and "we did not look" stay apart.
+        self.retry_log = RetryLog()
         if client is not None:
             self._client = client
         else:
@@ -109,6 +123,13 @@ class ModelClient:
             self._client = anthropic.Anthropic(
                 api_key=self._resolve_key(api_key, broker),
                 timeout=self.config.request_timeout,
+                # The SDK retries twice on its own by default. Left on, that
+                # would nest inside our five and make one recorded retry mean
+                # three real HTTP requests -- so every count this project
+                # reports, and every backoff it claims to have waited, would be
+                # wrong. One retry layer, and it is the one that writes things
+                # down.
+                max_retries=0,
             )
 
     def request_kwargs(self, messages: List[dict], tools: List[dict], system: str) -> dict:
@@ -137,27 +158,42 @@ class ModelClient:
         a mistyped model id, no network. Without it those surface only after a
         container has been built and the task's setup has run.
         """
-        try:
-            response = self._client.messages.count_tokens(
+        response = self._call(
+            "messages.count_tokens",
+            lambda: self._client.messages.count_tokens(
                 model=self.config.model,
                 messages=[{"role": "user", "content": "ping"}],
-            )
-        except Exception as exc:
-            raise ModelError(f"{type(exc).__name__}: {exc}") from exc
+            ),
+        )
         return getattr(response, "input_tokens", 0)
 
-    def generate(self, messages: List[dict], tools: List[dict], system: str) -> ModelResponse:
+    def _call(self, operation: str, func) -> Any:
+        """One API call, retried per the policy, failures normalised to ModelError.
+
+        Retrying preflight matters as much as retrying a turn: the whole reason
+        preflight exists is to fail before a container is built, and a flaky
+        network would otherwise make it the most likely thing to abort a run
+        that was going to be fine.
+        """
+        spent_before = len(self.retry_log)
         try:
-            response = self._client.messages.create(
-                **self.request_kwargs(messages, tools, system)
+            return retry_call(
+                operation, func, policy=self.retry_policy, on_retry=self.retry_log
             )
         except Exception as exc:
             # Kept as one type on purpose: from the loop's point of view every
             # one of these is "the turn did not happen". The class name is
             # preserved in the message so a rate limit stays distinguishable
             # from a bad request when the record is read back.
-            raise ModelError(f"{type(exc).__name__}: {exc}") from exc
+            spent = len(self.retry_log) - spent_before
+            suffix = f" (after {spent} retr{'y' if spent == 1 else 'ies'})" if spent else ""
+            raise ModelError(f"{type(exc).__name__}: {exc}{suffix}") from exc
 
+    def generate(self, messages: List[dict], tools: List[dict], system: str) -> ModelResponse:
+        response = self._call(
+            "messages.create",
+            lambda: self._client.messages.create(**self.request_kwargs(messages, tools, system)),
+        )
         return ModelResponse(
             content=[_as_dict(block) for block in response.content],
             stop_reason=getattr(response, "stop_reason", "") or "",

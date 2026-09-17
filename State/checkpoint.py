@@ -26,7 +26,11 @@ from uuid import uuid4
 #: Bumped when the meaning of a field changes, mirroring EVALUATOR_VERSION in
 #: Evaluation/result.py. A stored checkpoint from a different version is refused
 #: rather than resumed under rules it was not written under.
-CHECKPOINT_VERSION = 1
+#:
+#: 2: `retries` added. A v1 record would read back as "no retries", which is a
+#: claim about the environment it never actually made -- and resuming from one
+#: would silently reset a count the recovered run then continues from zero.
+CHECKPOINT_VERSION = 2
 
 #: Status of a checkpoint taken mid-run. Every other value is an Agent.loop
 #: StopReason -- the two share one field so that "still going" and "ended, here
@@ -74,6 +78,10 @@ class Checkpoint:
     cost_usd: Optional[float] = None
     summary: str = ""
     error: str = ""
+    #: Transient failures the harness absorbed before this point (Recovery
+    #: RetryAttempt dicts). Carried across a resume so the recovered run's
+    #: record covers the whole attempt, not just the part after the crash.
+    retries: List[dict] = field(default_factory=list)
 
     patch_sha256: str = ""
     patch_meta: dict = field(default_factory=dict)
@@ -107,13 +115,14 @@ class Checkpoint:
 
         A plain dict, matching `AgentLoop(resume_from=...)`: the loop must not
         learn the checkpoint format, and this module must not learn the loop's
-        types. The seam is four well-known keys and nothing else.
+        types. The seam is five well-known keys and nothing else.
         """
         return {
             "messages": self.messages,
             "tool_calls": self.tool_calls,
             "usage": self.usage,
             "turns": self.step,
+            "retries": self.retries,
         }
 
     def filename_stem(self) -> str:
@@ -138,6 +147,7 @@ class Checkpoint:
             "cost_usd": self.cost_usd,
             "summary": self.summary,
             "error": self.error,
+            "retries": self.retries,
             "patch_sha256": self.patch_sha256,
             "patch_meta": self.patch_meta,
             "patch_error": self.patch_error,
@@ -165,6 +175,7 @@ class Checkpoint:
             cost_usd=data.get("cost_usd"),
             summary=str(data.get("summary", "")),
             error=str(data.get("error", "")),
+            retries=data.get("retries") or [],
             patch_sha256=str(data.get("patch_sha256", "")),
             patch_meta=data.get("patch_meta") or {},
             patch_error=str(data.get("patch_error", "")),
@@ -176,6 +187,8 @@ class Checkpoint:
         line = f"step {self.step:>3}  {self.status:<18} {self.checkpoint_id}"
         if self.patch_meta.get("files"):
             line += f"  {len(self.patch_meta['files'])} file(s) changed"
+        if self.retries:
+            line += f"  {len(self.retries)} retried"
         if self.patch_error:
             line += f"  !! {self.patch_error[:60]}"
         return line

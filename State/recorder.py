@@ -70,6 +70,7 @@ class CheckpointRecorder:
             cost_usd=snapshot.cost_usd,
             summary=snapshot.summary,
             error=snapshot.error,
+            retries=snapshot.retries,
             patch_sha256=patch_sha,
             patch_meta=patch_meta,
             patch_error=patch_error,

@@ -8,6 +8,7 @@ Building out this project in different stages:
 4. Objective evaluation : Grade an agent by replaying its patch onto a clean checkout and running build, tests, benchmarks, mutations and static checks -- never by asking a model whether the answer looks right.
 5. Agent loop : Drive a real model through the sandboxed tools -- generate, execute, feed the result back -- until it reports done or hits a turn, token or cost budget.
 6. State and checkpointing : Write every turn to disk -- the conversation and the diff so far -- so a run killed partway can be rebuilt in a fresh container and finished, and graded the same way an uninterrupted one is.
+7. Recovery : Absorb the failures that say nothing about the agent -- a model call that times out, drops, or comes back rate-limited -- by retrying with an exponential backoff, and record every one so a run that needed working around never passes for a clean one.
 
 ## Running tools in the sandbox
 
@@ -241,6 +242,55 @@ sandbox, the loop, the client, the store object. All that is left is a
 directory. A new store reads it, a new container is built, the run finishes, and
 it grades `SOLVED`. That is the work surviving a boundary nothing in memory
 crossed.
+
+## Retrying what is worth retrying
+
+A model call that times out, loses its connection, or comes back `429` says
+nothing about whether the agent could solve the task. Letting one of those end a
+forty-turn run twenty turns in would put an environmental hiccup in the middle
+of a capability measurement, so `Recovery` absorbs them: five retries per
+operation, waiting 1s, 2s, 4s, 8s, 16s, about 31 seconds of patience before a
+call is given up on.
+
+```
+python -m Recovery                              # what the defaults actually do
+python -m Recovery --config Agent/config.yaml --taxonomy
+python -m Recovery.selftest
+```
+
+Three decisions worth knowing about:
+
+**Retrying is not silent.** A retry that rescues a run is invisible in every
+other field of the result, so a harness that did not write them down would make
+every environment look healthy. Each one is recorded with what failed, how long
+it waited, and whether the wait was ours or the server's -- onto the run record,
+into the checkpoint, and out through `EvaluationResult.agent["retries"]`. A task
+solved after four retries and one solved cleanly are not the same evidence.
+
+**Unrecognised failures are not retried.** Timeouts, dropped connections, 429s,
+529s and 5xx are repeated; a 401, a 400 or a mistyped model id is not, because
+it will fail identically five more times thirty-one seconds later. Anything the
+taxonomy does not recognise is treated the same way -- a programming error is
+not a transient one, and turning one clear traceback into six is not recovery.
+The classification is by exception class name walking the MRO, with the HTTP
+status as a fallback, so a provider error class added next quarter is still
+handled and the SDK never has to be imported to decide.
+
+**Tool timeouts are recorded but not retried here.** When a command in the
+sandbox times out, `Sandbox` destroys the container -- killing `docker exec` on
+the host leaves the process running inside, so tearing it down is the only way
+to stop it. By the time the failure surfaces there is nothing left to call
+again, and recovering from one means rebuilding from a checkpoint rather than
+repeating a call. That is the run-level operation `--resume` already performs,
+and wiring it to happen automatically belongs with Strategies C and F, not here.
+
+The policy lives in `Agent/config.yaml` rather than in code, because how hard a
+harness retries changes what its reported success rate means -- so it is
+configuration that travels with the run, and `python -m Recovery --config` will
+print the exact schedule a given set of numbers produces. The Anthropic SDK's
+own retry layer is switched off at construction; two nested layers would make
+one recorded retry mean three real requests, and every count here would be
+wrong.
 
 ## Objective evaluation
 

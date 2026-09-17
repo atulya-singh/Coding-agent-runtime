@@ -123,6 +123,10 @@ class TaskRun:
             "total_tokens": run.total_tokens,
             "cost_usd": run.cost_usd,
             "summary": run.summary,
+            # How much the environment had to be worked around to produce this
+            # grade. A solved task that needed four retries and one that needed
+            # none are not the same evidence about the harness.
+            "retries": len(run.retries),
             **lineage,
         }
 

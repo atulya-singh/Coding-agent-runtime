@@ -112,6 +112,12 @@ def _describe(run: TaskRun) -> str:
     ]
     if agent.summary:
         lines.append(f"  said      {agent.summary.strip()[:160]}")
+    if agent.retries:
+        kinds = sorted({entry.get("failure", "?") for entry in agent.retries})
+        waited = sum(entry.get("delay_s", 0.0) for entry in agent.retries)
+        lines.append(
+            f"  retried   {len(agent.retries)}x ({', '.join(kinds)}), {waited:.1f}s waited"
+        )
     if run.patch is not None:
         lines.append(
             f"  patch     {len(run.patch.files)} file(s), "

@@ -114,6 +114,10 @@ class AgentRun:
     summary: str = ""
     #: Why the run broke, for the reasons that are failures.
     error: str = ""
+    #: Every transient failure the harness absorbed (Recovery.RetryAttempt
+    #: dicts). A retried run looks identical to a clean one in every other
+    #: field, so without this the environment always looks healthy.
+    retries: List[dict] = field(default_factory=list)
 
     @property
     def total_tokens(self) -> int:
@@ -131,6 +135,7 @@ class AgentRun:
             "cost_usd": self.cost_usd,
             "summary": self.summary,
             "error": self.error,
+            "retries": self.retries,
             "messages": self.messages,
         }
 
@@ -159,6 +164,7 @@ class Snapshot:
     cost_usd: Optional[float] = None
     summary: str = ""
     error: str = ""
+    retries: List[dict] = field(default_factory=list)
 
     @property
     def is_terminal(self) -> bool:
@@ -237,6 +243,13 @@ class AgentLoop:
         # at the task, not the process that happens to be making it. Resetting
         # them would hand a resumed run a second full allowance.
         turns = int(prior.get("turns") or 0)
+        # Also carried: the retries the killed run absorbed. A recovered run
+        # that reported only its own would understate how much the environment
+        # actually misbehaved, which is exactly what this field is for.
+        prior_retries = list(prior.get("retries") or [])
+
+        def retries() -> List[dict]:
+            return prior_retries + self._client_retries()
 
         def record(status: str, summary: str = "", error: str = "") -> None:
             if self.on_turn is None:
@@ -253,6 +266,7 @@ class AgentLoop:
                     cost_usd=cost_usd(usage, self.config.pricing_for_model()),
                     summary=summary,
                     error=error,
+                    retries=retries(),
                 )
             )
 
@@ -269,6 +283,7 @@ class AgentLoop:
                 cost_usd=cost_usd(usage, self.config.pricing_for_model()),
                 summary=summary,
                 error=error,
+                retries=retries(),
             )
 
         # Before the first call to the model: a run killed in its opening
@@ -347,6 +362,19 @@ class AgentLoop:
             # Every tool_use is answered and the container is alive: the first
             # point since the last one where this run could be picked up again.
             record(IN_PROGRESS)
+
+    def _client_retries(self) -> List[dict]:
+        """What the model client has retried so far, if it keeps a log.
+
+        Read through getattr for the same reason `_sandbox_gone` is: the loop
+        runs against anything exposing `generate`, and a scripted client should
+        not have to grow a retry log it will never write to.
+        """
+        log = getattr(self.client, "retry_log", None)
+        if log is None:
+            return []
+        to_dicts = getattr(log, "to_dicts", None)
+        return to_dicts() if to_dicts is not None else [dict(entry) for entry in log]
 
     def _sandbox_gone(self) -> bool:
         """True once the toolset has no live container behind it.
