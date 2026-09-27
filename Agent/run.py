@@ -51,7 +51,7 @@ from Tasks.schema import Task
 
 from .client import ModelClient
 from .config import AgentConfig
-from .loop import AgentLoop, AgentRun
+from .loop import AgentLoop, AgentRun, StopReason
 
 logger = logging.getLogger("agent.run")
 
@@ -252,6 +252,41 @@ def run_task(
     run.duration_ms = (time.monotonic() - started) * 1000
     return run
 
+def run_task_with_rollback(
+    task: Task,
+    task_dir: Path,
+    max_rollbacks: int,
+    client: Any = None,
+    agent_config: Optional[AgentConfig] = None,
+    repo: Optional[Path] = None,
+    config: Optional[RunConfig] = None,
+    store: Optional[CheckpointStore] = None,
+    resume_from: Optional[Checkpoint] = None,
+) -> TaskRun:
+    """Strategy C: attempt the task, and if the sandbox dies out from under it
+    (StopReason.SANDBOX_GONE), automatically rebuild from the last checkpoint
+    and keep going -- up to `max_rollbacks` times -- instead of returning a
+    dead run. Any other stop reason is returned as-is, unjudged."""
+    if store is None:
+        # Nothing to roll back to without checkpoints -- one attempt, same as run_task.
+        return run_task(task, task_dir, client, agent_config, repo, config, store, resume_from)
+
+    rollbacks = 0
+    while True:
+        run = run_task(task, task_dir, client, agent_config, repo, config, store, resume_from)
+
+        if run.agent is None or run.agent.stop_reason != StopReason.SANDBOX_GONE:
+            return run  # agent decided, hit a limit, refused -- not ours to retry
+
+        if rollbacks >= max_rollbacks:
+            return run  # out of budget; report the last attempt honestly
+
+        checkpoint = store.latest(task.task_id)
+        if checkpoint is None or checkpoint.resumable:
+            return run  # nothing safe to roll back to
+
+        resume_from = checkpoint
+        rollbacks += 1
 
 def _recorder(
     store: CheckpointStore,

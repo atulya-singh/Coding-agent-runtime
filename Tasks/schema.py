@@ -101,7 +101,8 @@ class Task:
     setup: List[str] = field(default_factory=list)
     public_tests: str = ""
     # hidden_tests/hidden_test_files are grading-only (Phase 4) and must never be
-    # fed into the agent's context -- kept as separate fields/files for that reason.
+    # fed into the agent's context --
+    # kept as separate fields/files for that reason.
     hidden_tests: str = ""
     hidden_test_files: List[str] = field(default_factory=list)
     # What fraction of `hidden_tests` already passes on the base commit. A hidden
