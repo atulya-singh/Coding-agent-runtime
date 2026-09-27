@@ -33,7 +33,7 @@ from Tasks.loader import discover_task_dirs, load_task
 from .client import API_KEY_NAME, ModelClient, ModelError
 from .config import AgentConfig, load_config, validate_config
 from .replay import ScriptedClient, replay_fix
-from .run import RunConfig, TaskRun, run_task
+from .run import RunConfig, TaskRun, run_task_with_rollback
 
 DATASET_DIR = Path(__file__).parent.parent / "Tasks" / "dataset"
 DEFAULT_CONFIG_PATH = Path(__file__).parent / "config.yaml"
@@ -236,7 +236,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 continue
 
         print(f"\n=== {task.task_id}  [{task.category.value}]")
-        run = run_task(
+        run = run_task_with_rollback(
             task,
             task_dir,
             client=ScriptedClient(replay_fix(task, repo), agent_config) if args.replay else client,

@@ -58,6 +58,7 @@ logger = logging.getLogger("agent.run")
 #: Same ceiling the grader gives setup: `pip install -e .` on a cold cache is
 #: minutes, and a shorter limit would fail honest tasks on a slow network.
 DEFAULT_SETUP_TIMEOUT = 900.0
+MAX_ROLLBACKS = 5
 
 PROVIDER = "anthropic"
 
@@ -255,8 +256,8 @@ def run_task(
 def run_task_with_rollback(
     task: Task,
     task_dir: Path,
-    max_rollbacks: int,
     client: Any = None,
+    max_rollbacks: int = MAX_ROLLBACKS,
     agent_config: Optional[AgentConfig] = None,
     repo: Optional[Path] = None,
     config: Optional[RunConfig] = None,
