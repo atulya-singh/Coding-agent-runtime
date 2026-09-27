@@ -33,7 +33,7 @@ from Tasks.loader import discover_task_dirs, load_task
 from .client import API_KEY_NAME, ModelClient, ModelError
 from .config import AgentConfig, load_config, validate_config
 from .replay import ScriptedClient, replay_fix
-from .run import RunConfig, TaskRun, run_task_with_rollback
+from .run import MAX_ROLLBACKS, RunConfig, TaskRun, run_task_with_rollback
 
 DATASET_DIR = Path(__file__).parent.parent / "Tasks" / "dataset"
 DEFAULT_CONFIG_PATH = Path(__file__).parent / "config.yaml"
@@ -47,7 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="agent config YAML")
     parser.add_argument("--model", help="override the configured model")
     parser.add_argument("--max-turns", type=int, help="override the configured turn limit")
-
+    parser.add_argument("--max-rollbacks", type=int, help="override the configured rollback limit")
     parser.add_argument("--grade", action="store_true", help="grade each patch (a second container)")
     parser.add_argument("--dataset", default=str(DATASET_DIR))
     parser.add_argument("--repo-cache", default=str(DEFAULT_REPO_CACHE))
@@ -240,6 +240,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             task,
             task_dir,
             client=ScriptedClient(replay_fix(task, repo), agent_config) if args.replay else client,
+            max_rollbacks=args.max_rollbacks if args.max_rollbacks is not None else MAX_ROLLBACKS,
             agent_config=agent_config,
             repo=repo,
             config=config,
