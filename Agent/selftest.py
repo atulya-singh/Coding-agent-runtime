@@ -27,6 +27,7 @@ from Evaluation.selftest import Checks
 from Execution.tools.base import ToolResult
 from Recovery.context import ContextPolicy
 from Recovery.retry import RetryAttempt, RetryLog
+from State.checkpoint import Checkpoint
 from Tasks.harness import DEFAULT_REPO_CACHE, ensure_repo, file_at_commit
 from Tasks.loader import discover_task_dirs, load_task
 from Sandbox.secrets import SecretBroker
@@ -37,6 +38,7 @@ from .config import DEFAULT_MODEL, AgentConfig, validate_config
 from .loop import (
     IN_PROGRESS,
     AgentLoop,
+    AgentRun,
     Snapshot,
     StopReason,
     add_usage,
@@ -48,7 +50,7 @@ from .loop import (
 from .pricing import ModelPricing, cost_usd
 from .replay import SCRIPTED_USAGE as USAGE
 from .replay import ScriptedClient, finish_turn, replay_fix, text_turn, tool_turn
-from .run import RunConfig, TaskRun, run_task
+from .run import RunConfig, TaskRun, run_task, run_task_with_rollback
 from .tools import FINISH_TOOL_NAME, build_tool_specs
 
 DATASET_DIR = Path(__file__).parent.parent / "Tasks" / "dataset"
@@ -410,6 +412,161 @@ def check_sandbox_gone(c: Checks) -> None:
     c.check("the model is not asked again", len(client.seen_messages) == 1)
     c.check("the failed call is still answered", run.messages[-1]["role"] == "user")
     c.check("the reason says what broke", "torn down" in run.error)
+
+
+class FakeStore:
+    """Stands in for CheckpointStore: only `.latest` is used by
+    `run_task_with_rollback`, so that is the only thing this fakes."""
+
+    def __init__(self, checkpoint: Optional[Checkpoint] = None):
+        self.checkpoint = checkpoint
+        self.calls = 0
+
+    def latest(self, task_id: str) -> Optional[Checkpoint]:
+        self.calls += 1
+        return self.checkpoint
+
+
+class ScriptedRunTask:
+    """Stands in for run_task: returns each of `results` in turn, recording
+    the `resume_from` it was called with each time -- what a test checks to
+    confirm a rollback actually chained onto the checkpoint it was given,
+    rather than quietly starting over."""
+
+    def __init__(self, results: List[TaskRun]):
+        self.results = list(results)
+        self.calls: List[Optional[Checkpoint]] = []
+
+    def __call__(
+        self, task, task_dir, client=None, agent_config=None, repo=None,
+        config=None, store=None, resume_from=None,
+    ) -> TaskRun:
+        self.calls.append(resume_from)
+        return self.results.pop(0)
+
+
+def _died(task: Task) -> TaskRun:
+    return TaskRun(task_id=task.task_id, agent=AgentRun(task.task_id, "m", StopReason.SANDBOX_GONE))
+
+
+def _finished(task: Task, summary: str = "fixed it") -> TaskRun:
+    return TaskRun(
+        task_id=task.task_id,
+        agent=AgentRun(task.task_id, "m", StopReason.FINISHED, summary=summary),
+    )
+
+
+def check_rollback_recovers(c: Checks) -> None:
+    """The core claim: a container that dies mid-run is rebuilt from the last
+    checkpoint and keeps going, without the caller doing anything about it."""
+    task = sample_task()
+    attempts = ScriptedRunTask([_died(task), _died(task), _finished(task)])
+    checkpoint = Checkpoint(task_id=task.task_id, checkpoint_id="cp1")
+    store = FakeStore(checkpoint)
+
+    run = run_task_with_rollback(
+        task, Path("."), max_rollbacks=5, store=store, run_fn=attempts
+    )
+
+    c.equal("the run finishes once the sandbox stops dying", run.agent.stop_reason, StopReason.FINISHED)
+    c.equal("it took exactly the deaths it needed to recover from", len(attempts.calls), 3)
+    c.equal("the first attempt is fresh -- no checkpoint yet", attempts.calls[0], None)
+    c.equal("every retry after that resumes from the checkpoint", attempts.calls[1:], [checkpoint, checkpoint])
+
+
+def check_rollback_gives_up_at_the_limit(c: Checks) -> None:
+    """A sandbox that never recovers is reported honestly, not retried forever."""
+    task = sample_task()
+    attempts = ScriptedRunTask([_died(task), _died(task), _died(task)])
+    store = FakeStore(Checkpoint(task_id=task.task_id))
+
+    run = run_task_with_rollback(
+        task, Path("."), max_rollbacks=2, store=store, run_fn=attempts
+    )
+
+    c.equal("the last dead attempt is returned rather than raised", run.agent.stop_reason, StopReason.SANDBOX_GONE)
+    c.equal("exactly the first attempt plus the rollback budget, no more", len(attempts.calls), 3)
+
+
+def check_rollback_needs_a_checkpoint(c: Checks) -> None:
+    """Nothing on disk to rebuild from ends the attempt -- it must never mean
+    silently starting over and calling that a recovery."""
+    task = sample_task()
+    attempts = ScriptedRunTask([_died(task), _finished(task)])  # would recover, if given the chance
+    store = FakeStore(None)
+
+    run = run_task_with_rollback(
+        task, Path("."), max_rollbacks=5, store=store, run_fn=attempts
+    )
+
+    c.equal("the run ends on the dead attempt", run.agent.stop_reason, StopReason.SANDBOX_GONE)
+    c.equal("only the first attempt is made", len(attempts.calls), 1)
+
+
+def check_rollback_respects_an_unresumable_checkpoint(c: Checks) -> None:
+    """A checkpoint that refuses to be resumed is treated the same as none."""
+    task = sample_task()
+    attempts = ScriptedRunTask([_died(task), _finished(task)])
+    refused = Checkpoint(task_id=task.task_id, patch_error="the diff could not be taken")
+    store = FakeStore(refused)
+
+    c.check("the checkpoint really does refuse", bool(refused.resumable))
+    run = run_task_with_rollback(
+        task, Path("."), max_rollbacks=5, store=store, run_fn=attempts
+    )
+    c.equal("it is not used to resume", run.agent.stop_reason, StopReason.SANDBOX_GONE)
+    c.equal("only the first attempt is made", len(attempts.calls), 1)
+
+
+def check_rollback_ignores_other_stop_reasons(c: Checks) -> None:
+    """Only SANDBOX_GONE is ours to retry. Every other stop reason -- the agent
+    deciding, a limit, a refusal -- is returned exactly as-is, unjudged."""
+    task = sample_task()
+    for reason in StopReason:
+        if reason == StopReason.SANDBOX_GONE:
+            continue
+        result = TaskRun(task_id=task.task_id, agent=AgentRun(task.task_id, "m", reason))
+        attempts = ScriptedRunTask([result])
+        store = FakeStore(Checkpoint(task_id=task.task_id))
+
+        run = run_task_with_rollback(
+            task, Path("."), max_rollbacks=5, store=store, run_fn=attempts
+        )
+
+        c.equal(f"{reason.value} is returned untouched", run.agent.stop_reason, reason)
+        c.equal(f"{reason.value} never checks the checkpoint store", store.calls, 0)
+        c.equal(f"{reason.value} makes exactly one attempt", len(attempts.calls), 1)
+
+
+def check_rollback_needs_no_store(c: Checks) -> None:
+    """Without checkpointing there is nothing to roll back to: one attempt,
+    same as calling run_task directly."""
+    task = sample_task()
+    attempts = ScriptedRunTask([_died(task)])
+
+    run = run_task_with_rollback(
+        task, Path("."), max_rollbacks=5, store=None, run_fn=attempts
+    )
+
+    c.equal("no store means no retry, even for a dead sandbox", run.agent.stop_reason, StopReason.SANDBOX_GONE)
+    c.equal("exactly one attempt is made", len(attempts.calls), 1)
+
+
+def check_rollback_handles_missing_agent(c: Checks) -> None:
+    """A failure before the agent ever started (bad repo, broken setup) has no
+    SANDBOX_GONE stop reason to react to, and must not crash on the missing
+    `.agent` while checking for one."""
+    task = sample_task()
+    broken = TaskRun(task_id=task.task_id, infrastructure_error="setup step failed")
+    attempts = ScriptedRunTask([broken])
+    store = FakeStore(Checkpoint(task_id=task.task_id))
+
+    run = run_task_with_rollback(
+        task, Path("."), max_rollbacks=5, store=store, run_fn=attempts
+    )
+
+    c.check("a run with no agent at all is returned as-is", run.agent is None)
+    c.equal("only the first attempt is made", len(attempts.calls), 1)
 
 
 def check_stop_reason_attribution(c: Checks) -> None:
@@ -807,6 +964,13 @@ def run_offline(c: Checks) -> None:
     check_refusal(c)
     check_request_shape(c)
     check_sandbox_gone(c)
+    check_rollback_recovers(c)
+    check_rollback_gives_up_at_the_limit(c)
+    check_rollback_needs_a_checkpoint(c)
+    check_rollback_respects_an_unresumable_checkpoint(c)
+    check_rollback_ignores_other_stop_reasons(c)
+    check_rollback_needs_no_store(c)
+    check_rollback_handles_missing_agent(c)
     check_stop_reason_attribution(c)
     check_agent_record(c)
     check_run_infrastructure(c)

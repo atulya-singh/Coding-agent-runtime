@@ -36,7 +36,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from Evaluation.evaluator import EvaluationConfig, Evaluator
 from Evaluation.patch import Patch, apply_patch, collect_patch
@@ -263,18 +263,25 @@ def run_task_with_rollback(
     config: Optional[RunConfig] = None,
     store: Optional[CheckpointStore] = None,
     resume_from: Optional[Checkpoint] = None,
+    run_fn: Callable[..., TaskRun] = run_task,
 ) -> TaskRun:
     """Strategy C: attempt the task, and if the sandbox dies out from under it
     (StopReason.SANDBOX_GONE), automatically rebuild from the last checkpoint
     and keep going -- up to `max_rollbacks` times -- instead of returning a
-    dead run. Any other stop reason is returned as-is, unjudged."""
+    dead run. Any other stop reason is returned as-is, unjudged.
+
+    `run_fn` defaults to `run_task` and exists so a test can substitute a
+    scripted stand-in instead of a real container -- the same reason
+    `Recovery.retry_call` takes `sleep` and `classifier` as arguments rather
+    than calling the real ones directly.
+    """
     if store is None:
         # Nothing to roll back to without checkpoints -- one attempt, same as run_task.
-        return run_task(task, task_dir, client, agent_config, repo, config, store, resume_from)
+        return run_fn(task, task_dir, client, agent_config, repo, config, store, resume_from)
 
     rollbacks = 0
     while True:
-        run = run_task(task, task_dir, client, agent_config, repo, config, store, resume_from)
+        run = run_fn(task, task_dir, client, agent_config, repo, config, store, resume_from)
 
         if run.agent is None or run.agent.stop_reason != StopReason.SANDBOX_GONE:
             return run  # agent decided, hit a limit, refused -- not ours to retry
