@@ -82,6 +82,22 @@ context:
   window: 12
   validate_tool_calls: true
 
+# Which model takes over when the agent gets stuck (Recovery Strategy D). Only
+# a run that ends in `agent_loop` -- looping after Strategy B told it to stop --
+# escalates: a stronger model can fix a capability problem, not an API outage.
+# The stronger model gets the files as they were left plus a short summary of
+# the failed attempt, not the full transcript.
+#
+# Weakest first. Every model here needs a `pricing` entry below, or a run that
+# escalates into it reports an unknown cost. enabled: false is the control arm:
+# a stuck run stays stuck and is recorded that way.
+escalation:
+  enabled: true
+  ladder:
+    - claude-haiku-4-5
+    - claude-sonnet-5
+    - claude-opus-5
+
 # Token rates in dollars per million tokens. Rates are configuration, not code:
 # a stale number here would silently corrupt every cost figure the project
 # reports, and a model with no entry reports an unknown cost rather than a free

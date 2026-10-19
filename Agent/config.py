@@ -15,6 +15,7 @@ from typing import Dict, List, Optional
 import yaml
 
 from Recovery.context import ContextPolicy, validate_context_policy
+from Recovery.escalation import EscalationPolicy, validate_escalation_policy
 from Recovery.retry import RetryPolicy, validate_policy
 
 from .pricing import ModelPricing
@@ -62,6 +63,10 @@ class AgentConfig:
     # Also an experimental variable: plan.md Experiment 3 compares a run that
     # gets told against one that does not, and `enabled: false` is that control.
     context: ContextPolicy = field(default_factory=ContextPolicy)
+    # Which stronger model takes over when the agent is stuck (Recovery
+    # Strategy D). An experimental variable like the two above: a success rate
+    # with escalation on is a claim about the ladder, not about `model` alone.
+    escalation: EscalationPolicy = field(default_factory=EscalationPolicy)
     # Token rates per model, keyed by model id. Not hardcoded in pricing.py: see
     # that module for why. A model missing here reports an unknown cost rather
     # than a zero one.
@@ -82,6 +87,7 @@ class AgentConfig:
             "request_timeout": self.request_timeout,
             "retry": self.retry.to_dict(),
             "context": self.context.to_dict(),
+            "escalation": self.escalation.to_dict(),
             "pricing": {name: rates.to_dict() for name, rates in self.pricing.items()},
         }
 
@@ -105,6 +111,7 @@ class AgentConfig:
             request_timeout=float(data.get("request_timeout", 120.0)),
             retry=RetryPolicy.from_dict(data.get("retry")),
             context=ContextPolicy.from_dict(data.get("context")),
+            escalation=EscalationPolicy.from_dict(data.get("escalation")),
             pricing={
                 name: ModelPricing.from_dict(rates)
                 for name, rates in (data.get("pricing") or {}).items()
@@ -146,6 +153,7 @@ def validate_config(config: AgentConfig) -> List[str]:
         errors.append(f"request_timeout must be positive, got {config.request_timeout}")
     errors += [f"retry: {error}" for error in validate_policy(config.retry)]
     errors += [f"context: {error}" for error in validate_context_policy(config.context)]
+    errors += [f"escalation: {error}" for error in validate_escalation_policy(config.escalation)]
     return errors
 
 
